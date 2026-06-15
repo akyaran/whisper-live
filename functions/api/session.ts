@@ -1,0 +1,84 @@
+interface Env {
+  OPENAI_API_KEY: string;
+}
+
+const sessionConfig = {
+  type: "transcription",
+  audio: {
+    input: {
+      transcription: {
+        model: "gpt-realtime-whisper",
+        language: "en",
+        delay: "low"
+      },
+      turn_detection: null
+    }
+  }
+};
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type"
+};
+
+export const onRequestOptions: PagesFunction<Env> = async () =>
+  new Response(null, { status: 204, headers: corsHeaders });
+
+export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
+  if (!env.OPENAI_API_KEY) {
+    return json({ error: "OPENAI_API_KEY is not configured." }, 500);
+  }
+
+  const contentType = request.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/sdp")) {
+    return json({ error: "Expected Content-Type: application/sdp." }, 415);
+  }
+
+  const sdp = await request.text();
+  if (!sdp.trim()) {
+    return json({ error: "Missing SDP offer." }, 400);
+  }
+
+  const form = new FormData();
+  form.set("sdp", sdp);
+  form.set("session", JSON.stringify(sessionConfig));
+
+  const response = await fetch("https://api.openai.com/v1/realtime/calls", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      "OpenAI-Safety-Identifier": "whisper-live-pwa"
+    },
+    body: form
+  });
+
+  const body = await response.text();
+  if (!response.ok) {
+    return json(
+      {
+        error: "OpenAI Realtime session creation failed.",
+        detail: body
+      },
+      response.status
+    );
+  }
+
+  return new Response(body, {
+    status: 200,
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "application/sdp"
+    }
+  });
+};
+
+function json(data: unknown, status: number) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "application/json"
+    }
+  });
+}

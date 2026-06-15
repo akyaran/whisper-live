@@ -1,0 +1,18 @@
+{
+  "name": "Whisper Live Transcript",
+  "short_name": "Whisper Live",
+  "description": "English realtime transcription with OpenAI Realtime Whisper.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f2ea",
+  "theme_color": "#f6f2ea",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
