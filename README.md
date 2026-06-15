@@ -9,6 +9,7 @@ Cloudflare Pages + Pages Functions + PWA for English realtime transcription with
 - Sends the OpenAI API key only from Cloudflare Pages Functions.
 - Shows live transcript deltas and final transcript lines.
 - Switches between English-only transcription and English-to-Japanese live translation.
+- Keeps the live view to the latest few lines while retaining a full transcript panel.
 - Supports copy, clear, and `.txt` download.
 
 ## Local Setup

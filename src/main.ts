@@ -3,6 +3,8 @@ import "./styles.css";
 type AppState = "idle" | "requesting-mic" | "connecting" | "recording" | "stopping" | "error";
 type AppMode = "transcript" | "translate";
 
+const APP_VERSION = "v0.4.0";
+
 type RealtimeEvent =
   | {
       type: "conversation.item.input_audio_transcription.delta";
@@ -91,7 +93,10 @@ app.innerHTML = `
     <header class="topbar">
       <div>
         <p id="modeBadge" class="eyebrow">OpenAI Realtime Whisper</p>
-        <h1>Whisper Live</h1>
+        <div class="title-row">
+          <h1>Whisper Live</h1>
+          <span id="versionBadge" class="version-badge">v0.4.0</span>
+        </div>
       </div>
       <span id="statusBadge" class="status-badge" data-state="idle">Ready</span>
     </header>
@@ -140,6 +145,7 @@ app.innerHTML = `
         <div class="actions">
           <button id="copyButton" type="button">Copy</button>
           <button id="downloadButton" type="button">Download</button>
+          <button id="fullTextButton" type="button" aria-expanded="false">Full text</button>
           <button id="clearButton" type="button">Clear</button>
         </div>
       </div>
@@ -160,11 +166,20 @@ app.innerHTML = `
           <div id="translationLine" class="translation-text is-empty" aria-live="polite">Japanese translation will appear here.</div>
         </article>
       </div>
+
+      <section id="fullTextPanel" class="full-text-panel" aria-label="Full transcript" hidden>
+        <div class="full-text-header">
+          <p class="eyebrow">Full text</p>
+          <button id="closeFullTextButton" type="button">Close</button>
+        </div>
+        <pre id="fullTextContent"></pre>
+      </section>
     </section>
   </main>
 `;
 
 const modeBadge = getElement<HTMLParagraphElement>("modeBadge");
+const versionBadge = getElement<HTMLSpanElement>("versionBadge");
 const recorderTitle = getElement<HTMLHeadingElement>("recorderTitle");
 const recordButton = getElement<HTMLButtonElement>("recordButton");
 const recordButtonText = getElement<HTMLSpanElement>("recordButtonText");
@@ -175,15 +190,20 @@ const finalList = getElement<HTMLOListElement>("finalList");
 const emptyState = getElement<HTMLParagraphElement>("emptyState");
 const copyButton = getElement<HTMLButtonElement>("copyButton");
 const downloadButton = getElement<HTMLButtonElement>("downloadButton");
+const fullTextButton = getElement<HTMLButtonElement>("fullTextButton");
+const closeFullTextButton = getElement<HTMLButtonElement>("closeFullTextButton");
 const clearButton = getElement<HTMLButtonElement>("clearButton");
 const transcriptView = getElement<HTMLDivElement>("transcriptView");
 const translationView = getElement<HTMLDivElement>("translationView");
 const sourceLine = getElement<HTMLDivElement>("sourceLine");
 const translationLine = getElement<HTMLDivElement>("translationLine");
+const fullTextPanel = getElement<HTMLElement>("fullTextPanel");
+const fullTextContent = getElement<HTMLPreElement>("fullTextContent");
 const modeInputs = [...document.querySelectorAll<HTMLInputElement>('input[name="mode"]')];
 
 let state: AppState = "idle";
 let appMode: AppMode = "transcript";
+let fullTextOpen = false;
 let session: SessionResources | null = null;
 let finalLines = new Map<string, FinalLine>();
 let liveDeltas = new Map<string, string>();
@@ -222,6 +242,14 @@ clearButton.addEventListener("click", () => {
   clearTranscript();
 });
 
+fullTextButton.addEventListener("click", () => {
+  setFullTextOpen(!fullTextOpen);
+});
+
+closeFullTextButton.addEventListener("click", () => {
+  setFullTextOpen(false);
+});
+
 window.addEventListener("beforeunload", () => {
   closeSession();
 });
@@ -234,6 +262,7 @@ if ("serviceWorker" in navigator) {
   });
 }
 
+versionBadge.textContent = APP_VERSION;
 setMode("transcript");
 
 async function startRecording() {
@@ -542,16 +571,20 @@ function renderTranscript() {
     translationLine.textContent = translation || "Japanese translation will appear here.";
     sourceLine.classList.toggle("is-empty", !source);
     translationLine.classList.toggle("is-empty", !translation);
+    scrollToLatest(sourceLine);
+    scrollToLatest(translationLine);
+    renderFullText();
     return;
   }
 
   const liveText = [...liveDeltas.values()].join(" ").trim();
   liveLine.textContent = liveText || "Live words will appear here.";
   liveLine.classList.toggle("is-empty", !liveText);
+  scrollToLatest(liveLine);
 
   const lines = [...finalLines.values()].sort((a, b) => a.completedAt - b.completedAt);
   finalList.replaceChildren(
-    ...lines.map((line) => {
+    ...lines.slice(-5).map((line) => {
       const item = document.createElement("li");
       item.textContent = line.text;
       item.dataset.itemId = line.itemId;
@@ -560,6 +593,7 @@ function renderTranscript() {
   );
 
   emptyState.hidden = lines.length > 0;
+  renderFullText();
 }
 
 function setMode(nextMode: AppMode) {
@@ -632,6 +666,25 @@ function clearTranscript() {
   sourceText = "";
   translatedText = "";
   renderTranscript();
+}
+
+function setFullTextOpen(open: boolean) {
+  fullTextOpen = open;
+  fullTextPanel.hidden = !open;
+  fullTextButton.setAttribute("aria-expanded", String(open));
+  fullTextButton.textContent = open ? "Hide full" : "Full text";
+  renderFullText();
+}
+
+function renderFullText() {
+  const transcript = getTranscriptText();
+  fullTextContent.textContent = transcript || "No transcript yet.";
+}
+
+function scrollToLatest(element: HTMLElement) {
+  requestAnimationFrame(() => {
+    element.scrollTop = element.scrollHeight;
+  });
 }
 
 async function copyTranscript() {

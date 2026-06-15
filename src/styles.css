@@ -72,6 +72,26 @@ h1 {
   line-height: 0.92;
 }
 
+.title-row {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.version-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 4px 9px;
+  border: 1px solid #d7c9ae;
+  border-radius: 999px;
+  background: #fffaf2;
+  color: #6f5b37;
+  font-size: 0.82rem;
+  font-weight: 900;
+}
+
 h2 {
   color: #1e2f2f;
   font-size: 1.1rem;
@@ -277,11 +297,13 @@ h2 {
 
 .live-line {
   min-height: 74px;
+  max-height: calc(1.14em * 5 + 32px);
   padding: 16px 0;
   color: #224a4a;
   font-size: clamp(1.45rem, 5vw, 2.6rem);
   font-weight: 850;
   line-height: 1.14;
+  overflow: hidden;
   overflow-wrap: anywhere;
 }
 
@@ -332,10 +354,12 @@ h2 {
 
 .translation-text {
   min-height: 180px;
+  max-height: calc(1.28em * 5);
   color: #224a4a;
   font-size: clamp(1.12rem, 3.8vw, 2rem);
   font-weight: 800;
   line-height: 1.28;
+  overflow: hidden;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
@@ -344,6 +368,53 @@ h2 {
   color: #8a7a61;
   font-size: 1rem;
   font-weight: 700;
+}
+
+.full-text-panel {
+  margin-top: 16px;
+  padding: 14px;
+  border-radius: 8px;
+  background: #fffaf2;
+}
+
+.full-text-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.full-text-header .eyebrow {
+  margin-bottom: 0;
+}
+
+.full-text-header button {
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid #d7c9ae;
+  border-radius: 8px;
+  background: white;
+  color: #243333;
+  font-size: 0.86rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.full-text-panel pre {
+  max-height: 42vh;
+  padding: 12px;
+  margin: 0;
+  border-radius: 8px;
+  background: rgba(34, 74, 74, 0.08);
+  color: #243333;
+  font-family: inherit;
+  font-size: 1rem;
+  font-weight: 650;
+  line-height: 1.5;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 640px) {
@@ -379,7 +450,7 @@ h2 {
 
   .actions {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     width: 100%;
   }
 
