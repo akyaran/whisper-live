@@ -31,6 +31,10 @@ button {
   font: inherit;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 .shell {
   width: min(100%, 980px);
   min-height: 100vh;
@@ -98,12 +102,65 @@ h2 {
   color: white;
 }
 
+.mode-panel,
 .recorder,
 .transcript-panel {
   border: 1px solid rgba(34, 74, 74, 0.14);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.72);
   box-shadow: 0 20px 60px rgba(36, 51, 51, 0.08);
+}
+
+.mode-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 18px;
+  margin-bottom: 14px;
+}
+
+.mode-toggle {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  width: min(100%, 320px);
+  padding: 4px;
+  border: 1px solid #d7c9ae;
+  border-radius: 8px;
+  background: #fffaf2;
+}
+
+.mode-toggle label {
+  min-width: 0;
+}
+
+.mode-toggle input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.mode-toggle span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  padding: 0 10px;
+  border-radius: 6px;
+  color: #576565;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.mode-toggle input:checked + span {
+  background: #224a4a;
+  color: #fffaf2;
+}
+
+.mode-toggle input:disabled + span {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .recorder {
@@ -259,10 +316,49 @@ h2 {
   font-weight: 700;
 }
 
+.translation-view {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  padding-top: 16px;
+}
+
+.translation-column {
+  min-width: 0;
+  padding: 14px;
+  border-radius: 8px;
+  background: #fffaf2;
+}
+
+.translation-text {
+  min-height: 180px;
+  color: #224a4a;
+  font-size: clamp(1.12rem, 3.8vw, 2rem);
+  font-weight: 800;
+  line-height: 1.28;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.translation-text.is-empty {
+  color: #8a7a61;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
 @media (max-width: 640px) {
   .topbar {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .mode-panel {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .mode-toggle {
+    width: 100%;
   }
 
   .recorder {
@@ -289,6 +385,14 @@ h2 {
 
   .actions button {
     padding: 0 8px;
+  }
+
+  .translation-view {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .translation-text {
+    min-height: 128px;
   }
 }
 

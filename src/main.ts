@@ -1,8 +1,9 @@
 import "./styles.css";
 
 type AppState = "idle" | "requesting-mic" | "connecting" | "recording" | "stopping" | "error";
+type AppMode = "transcript" | "translate";
 
-type TranscriptEvent =
+type RealtimeEvent =
   | {
       type: "conversation.item.input_audio_transcription.delta";
       item_id?: string;
@@ -14,6 +15,14 @@ type TranscriptEvent =
       item_id?: string;
       content_index?: number;
       transcript?: string;
+    }
+  | {
+      type: "session.input_transcript.delta";
+      delta?: string;
+    }
+  | {
+      type: "session.output_transcript.delta";
+      delta?: string;
     }
   | {
       type: "error";
@@ -31,7 +40,17 @@ interface FinalLine {
   completedAt: number;
 }
 
+interface TranslationSecretResponse {
+  endpoint: string;
+  clientSecret:
+    | string
+    | {
+        value?: string;
+      };
+}
+
 interface SessionResources {
+  mode: AppMode;
   pc: RTCPeerConnection;
   dc: RTCDataChannel;
   stream: MediaStream;
@@ -46,6 +65,19 @@ const statusCopy: Record<AppState, string> = {
   error: "Needs attention"
 };
 
+const modeCopy: Record<AppMode, { title: string; helper: string; badge: string }> = {
+  transcript: {
+    title: "English realtime transcript",
+    helper: "Tap start, allow the microphone, and speak English.",
+    badge: "OpenAI Realtime Whisper"
+  },
+  translate: {
+    title: "English to Japanese live translation",
+    helper: "Tap start, speak English, and watch Japanese translation appear.",
+    badge: "OpenAI Realtime Translate"
+  }
+};
+
 const app = document.querySelector<HTMLDivElement>("#app");
 
 if (!app) {
@@ -56,11 +88,28 @@ app.innerHTML = `
   <main class="shell">
     <header class="topbar">
       <div>
-        <p class="eyebrow">OpenAI Realtime Whisper</p>
+        <p id="modeBadge" class="eyebrow">OpenAI Realtime Whisper</p>
         <h1>Whisper Live</h1>
       </div>
       <span id="statusBadge" class="status-badge" data-state="idle">Ready</span>
     </header>
+
+    <section class="mode-panel" aria-labelledby="modeTitle">
+      <div>
+        <p class="eyebrow">Mode</p>
+        <h2 id="modeTitle">Output</h2>
+      </div>
+      <div class="mode-toggle" role="radiogroup" aria-label="Output mode">
+        <label>
+          <input type="radio" name="mode" value="transcript" checked />
+          <span>Transcript</span>
+        </label>
+        <label>
+          <input type="radio" name="mode" value="translate" />
+          <span>Translate</span>
+        </label>
+      </div>
+    </section>
 
     <section class="recorder" aria-labelledby="recorderTitle">
       <div class="meter" aria-hidden="true">
@@ -92,13 +141,29 @@ app.innerHTML = `
           <button id="clearButton" type="button">Clear</button>
         </div>
       </div>
-      <div id="liveLine" class="live-line" aria-live="polite">Live words will appear here.</div>
-      <ol id="finalList" class="final-list" aria-label="Final transcript lines"></ol>
-      <p id="emptyState" class="empty-state">No final transcript yet.</p>
+
+      <div id="transcriptView">
+        <div id="liveLine" class="live-line is-empty" aria-live="polite">Live words will appear here.</div>
+        <ol id="finalList" class="final-list" aria-label="Final transcript lines"></ol>
+        <p id="emptyState" class="empty-state">No final transcript yet.</p>
+      </div>
+
+      <div id="translationView" class="translation-view" hidden>
+        <article class="translation-column">
+          <p class="eyebrow">English</p>
+          <div id="sourceLine" class="translation-text is-empty" aria-live="polite">English source will appear here.</div>
+        </article>
+        <article class="translation-column">
+          <p class="eyebrow">Japanese</p>
+          <div id="translationLine" class="translation-text is-empty" aria-live="polite">日本語訳がここに表示されます。</div>
+        </article>
+      </div>
     </section>
   </main>
 `;
 
+const modeBadge = getElement<HTMLParagraphElement>("modeBadge");
+const recorderTitle = getElement<HTMLHeadingElement>("recorderTitle");
 const recordButton = getElement<HTMLButtonElement>("recordButton");
 const recordButtonText = getElement<HTMLSpanElement>("recordButtonText");
 const statusBadge = getElement<HTMLSpanElement>("statusBadge");
@@ -109,11 +174,19 @@ const emptyState = getElement<HTMLParagraphElement>("emptyState");
 const copyButton = getElement<HTMLButtonElement>("copyButton");
 const downloadButton = getElement<HTMLButtonElement>("downloadButton");
 const clearButton = getElement<HTMLButtonElement>("clearButton");
+const transcriptView = getElement<HTMLDivElement>("transcriptView");
+const translationView = getElement<HTMLDivElement>("translationView");
+const sourceLine = getElement<HTMLDivElement>("sourceLine");
+const translationLine = getElement<HTMLDivElement>("translationLine");
+const modeInputs = [...document.querySelectorAll<HTMLInputElement>('input[name="mode"]')];
 
 let state: AppState = "idle";
+let appMode: AppMode = "transcript";
 let session: SessionResources | null = null;
 let finalLines = new Map<string, FinalLine>();
 let liveDeltas = new Map<string, string>();
+let sourceText = "";
+let translatedText = "";
 let stopTimer: number | undefined;
 
 recordButton.addEventListener("click", () => {
@@ -127,6 +200,16 @@ recordButton.addEventListener("click", () => {
   }
 });
 
+for (const input of modeInputs) {
+  input.addEventListener("change", () => {
+    if (!input.checked || state === "recording" || state === "connecting" || state === "requesting-mic") {
+      return;
+    }
+
+    setMode(input.value === "translate" ? "translate" : "transcript");
+  });
+}
+
 copyButton.addEventListener("click", () => {
   void copyTranscript();
 });
@@ -134,9 +217,7 @@ copyButton.addEventListener("click", () => {
 downloadButton.addEventListener("click", downloadTranscript);
 
 clearButton.addEventListener("click", () => {
-  finalLines = new Map();
-  liveDeltas = new Map();
-  renderTranscript();
+  clearTranscript();
 });
 
 window.addEventListener("beforeunload", () => {
@@ -150,6 +231,8 @@ if ("serviceWorker" in navigator) {
     });
   });
 }
+
+setMode("transcript");
 
 async function startRecording() {
   setState("requesting-mic");
@@ -178,7 +261,11 @@ async function startRecording() {
 
     dc.addEventListener("open", () => {
       setState("recording");
-      setHelper("Speak naturally. Tap stop to finalize the current transcript.");
+      setHelper(
+        appMode === "translate"
+          ? "Speak naturally. English and Japanese text will stream below."
+          : "Speak naturally. Tap stop to finalize the current transcript."
+      );
     });
 
     dc.addEventListener("message", (event) => {
@@ -203,29 +290,77 @@ async function startRecording() {
       throw new Error("Browser did not create an SDP offer.");
     }
 
-    const response = await fetch("/api/session", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/sdp"
-      },
-      body: sdp
-    });
-
-    const answerSdp = await response.text();
-    if (!response.ok) {
-      throw new Error(readApiError(answerSdp));
-    }
+    const answerSdp =
+      appMode === "translate" ? await createTranslationAnswer(sdp) : await createTranscriptAnswer(sdp);
 
     await pc.setRemoteDescription({
       type: "answer",
       sdp: answerSdp
     });
 
-    session = { pc, dc, stream };
+    session = { mode: appMode, pc, dc, stream };
   } catch (error) {
     closeSession();
     showError(error instanceof Error ? error.message : "Could not start recording.");
   }
+}
+
+async function createTranscriptAnswer(sdp: string) {
+  const response = await fetch("/api/session?mode=transcript", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/sdp"
+    },
+    body: sdp
+  });
+
+  const answerSdp = await response.text();
+  if (!response.ok) {
+    throw new Error(readApiError(answerSdp));
+  }
+
+  return answerSdp;
+}
+
+async function createTranslationAnswer(sdp: string) {
+  const sessionResponse = await fetch("/api/session?mode=translate", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ targetLanguage: "ja" })
+  });
+
+  const sessionBody = await sessionResponse.text();
+  if (!sessionResponse.ok) {
+    throw new Error(readApiError(sessionBody));
+  }
+
+  const translationSession = JSON.parse(sessionBody) as TranslationSecretResponse;
+  const clientSecret =
+    typeof translationSession.clientSecret === "string"
+      ? translationSession.clientSecret
+      : translationSession.clientSecret.value;
+
+  if (!translationSession.endpoint || !clientSecret) {
+    throw new Error("Translation session did not include a client secret.");
+  }
+
+  const sdpResponse = await fetch(translationSession.endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${clientSecret}`,
+      "Content-Type": "application/sdp"
+    },
+    body: sdp
+  });
+
+  const answerSdp = await sdpResponse.text();
+  if (!sdpResponse.ok) {
+    throw new Error(answerSdp || "Translation call setup failed.");
+  }
+
+  return answerSdp;
 }
 
 async function stopRecording() {
@@ -242,7 +377,11 @@ async function stopRecording() {
   }
 
   if (session.dc.readyState === "open") {
-    session.dc.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+    session.dc.send(
+      JSON.stringify({
+        type: session.mode === "translate" ? "session.close" : "input_audio_buffer.commit"
+      })
+    );
   }
 
   window.clearTimeout(stopTimer);
@@ -254,10 +393,10 @@ async function stopRecording() {
 }
 
 function handleRealtimeEvent(payload: string) {
-  let event: TranscriptEvent;
+  let event: RealtimeEvent;
 
   try {
-    event = JSON.parse(payload) as TranscriptEvent;
+    event = JSON.parse(payload) as RealtimeEvent;
   } catch {
     return;
   }
@@ -267,14 +406,14 @@ function handleRealtimeEvent(payload: string) {
     return;
   }
 
-  if (isDeltaEvent(event)) {
+  if (isTranscriptDeltaEvent(event)) {
     const key = lineKey(event.item_id, event.content_index);
     liveDeltas.set(key, `${liveDeltas.get(key) ?? ""}${event.delta ?? ""}`);
     renderTranscript();
     return;
   }
 
-  if (isCompletedEvent(event)) {
+  if (isTranscriptCompletedEvent(event)) {
     const key = lineKey(event.item_id, event.content_index);
     const transcript = (event.transcript ?? liveDeltas.get(key) ?? "").trim();
 
@@ -288,26 +427,60 @@ function handleRealtimeEvent(payload: string) {
 
     liveDeltas.delete(key);
     renderTranscript();
+    return;
+  }
+
+  if (isTranslationInputDeltaEvent(event)) {
+    sourceText += event.delta ?? "";
+    renderTranscript();
+    return;
+  }
+
+  if (isTranslationOutputDeltaEvent(event)) {
+    translatedText += event.delta ?? "";
+    renderTranscript();
   }
 }
 
-function isErrorEvent(event: TranscriptEvent): event is Extract<TranscriptEvent, { type: "error" }> {
+function isErrorEvent(event: RealtimeEvent): event is Extract<RealtimeEvent, { type: "error" }> {
   return event.type === "error";
 }
 
-function isDeltaEvent(
-  event: TranscriptEvent
-): event is Extract<TranscriptEvent, { type: "conversation.item.input_audio_transcription.delta" }> {
+function isTranscriptDeltaEvent(
+  event: RealtimeEvent
+): event is Extract<RealtimeEvent, { type: "conversation.item.input_audio_transcription.delta" }> {
   return event.type === "conversation.item.input_audio_transcription.delta";
 }
 
-function isCompletedEvent(
-  event: TranscriptEvent
-): event is Extract<TranscriptEvent, { type: "conversation.item.input_audio_transcription.completed" }> {
+function isTranscriptCompletedEvent(
+  event: RealtimeEvent
+): event is Extract<RealtimeEvent, { type: "conversation.item.input_audio_transcription.completed" }> {
   return event.type === "conversation.item.input_audio_transcription.completed";
 }
 
+function isTranslationInputDeltaEvent(
+  event: RealtimeEvent
+): event is Extract<RealtimeEvent, { type: "session.input_transcript.delta" }> {
+  return event.type === "session.input_transcript.delta";
+}
+
+function isTranslationOutputDeltaEvent(
+  event: RealtimeEvent
+): event is Extract<RealtimeEvent, { type: "session.output_transcript.delta" }> {
+  return event.type === "session.output_transcript.delta";
+}
+
 function renderTranscript() {
+  if (appMode === "translate") {
+    const source = sourceText.trim();
+    const translation = translatedText.trim();
+    sourceLine.textContent = source || "English source will appear here.";
+    translationLine.textContent = translation || "日本語訳がここに表示されます。";
+    sourceLine.classList.toggle("is-empty", !source);
+    translationLine.classList.toggle("is-empty", !translation);
+    return;
+  }
+
   const liveText = [...liveDeltas.values()].join(" ").trim();
   liveLine.textContent = liveText || "Live words will appear here.";
   liveLine.classList.toggle("is-empty", !liveText);
@@ -325,6 +498,21 @@ function renderTranscript() {
   emptyState.hidden = lines.length > 0;
 }
 
+function setMode(nextMode: AppMode) {
+  appMode = nextMode;
+  modeBadge.textContent = modeCopy[nextMode].badge;
+  recorderTitle.textContent = modeCopy[nextMode].title;
+  transcriptView.hidden = nextMode === "translate";
+  translationView.hidden = nextMode === "transcript";
+
+  for (const input of modeInputs) {
+    input.checked = input.value === nextMode;
+  }
+
+  clearTranscript();
+  setHelper(modeCopy[nextMode].helper);
+}
+
 function setState(nextState: AppState) {
   state = nextState;
   statusBadge.textContent = statusCopy[nextState];
@@ -334,6 +522,10 @@ function setState(nextState: AppState) {
   const isBusy = nextState === "requesting-mic" || nextState === "connecting" || nextState === "stopping";
   recordButton.disabled = isBusy;
   recordButtonText.textContent = nextState === "recording" ? "Stop" : "Start";
+
+  for (const input of modeInputs) {
+    input.disabled = nextState !== "idle" && nextState !== "error";
+  }
 }
 
 function setHelper(message: string) {
@@ -364,6 +556,14 @@ function closeSession() {
   session = null;
 }
 
+function clearTranscript() {
+  finalLines = new Map();
+  liveDeltas = new Map();
+  sourceText = "";
+  translatedText = "";
+  renderTranscript();
+}
+
 async function copyTranscript() {
   const transcript = getTranscriptText();
 
@@ -391,13 +591,25 @@ function downloadTranscript() {
   const blob = new Blob([transcript, "\n"], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
+  const suffix = appMode === "translate" ? "translation" : "transcript";
   link.href = url;
-  link.download = `whisper-live-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`;
+  link.download = `whisper-live-${suffix}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`;
   link.click();
   URL.revokeObjectURL(url);
 }
 
 function getTranscriptText() {
+  if (appMode === "translate") {
+    const source = sourceText.trim();
+    const translation = translatedText.trim();
+
+    if (!source && !translation) {
+      return "";
+    }
+
+    return [`English:\n${source || "(empty)"}`, `Japanese:\n${translation || "(empty)"}`].join("\n\n");
+  }
+
   return [...finalLines.values()]
     .sort((a, b) => a.completedAt - b.completedAt)
     .map((line) => line.text)
@@ -407,8 +619,9 @@ function getTranscriptText() {
 
 function readApiError(text: string) {
   try {
-    const data = JSON.parse(text) as { error?: string; detail?: string };
-    return data.detail || data.error || "Session request failed.";
+    const data = JSON.parse(text) as { error?: string; detail?: unknown };
+    const detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
+    return detail || data.error || "Session request failed.";
   } catch {
     return text || "Session request failed.";
   }

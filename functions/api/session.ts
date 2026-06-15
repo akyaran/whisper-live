@@ -2,7 +2,9 @@ interface Env {
   OPENAI_API_KEY: string;
 }
 
-const sessionConfig = {
+type SessionMode = "transcript" | "translate";
+
+const transcriptSessionConfig = {
   type: "transcription",
   audio: {
     input: {
@@ -12,6 +14,17 @@ const sessionConfig = {
         delay: "low"
       },
       turn_detection: null
+    }
+  }
+};
+
+const translationSessionConfig = {
+  session: {
+    model: "gpt-realtime-translate",
+    audio: {
+      output: {
+        language: "ja"
+      }
     }
   }
 };
@@ -31,6 +44,16 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
   }
 
   const contentType = request.headers.get("content-type") ?? "";
+  const mode = getMode(request, contentType);
+
+  if (mode === "translate") {
+    return createTranslationSession(env);
+  }
+
+  return createTranscriptSession(request, env, contentType);
+};
+
+async function createTranscriptSession(request: Request, env: Env, contentType: string) {
   if (!contentType.includes("application/sdp")) {
     return json({ error: "Expected Content-Type: application/sdp." }, 415);
   }
@@ -42,7 +65,7 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
 
   const form = new FormData();
   form.set("sdp", sdp);
-  form.set("session", JSON.stringify(sessionConfig));
+  form.set("session", JSON.stringify(transcriptSessionConfig));
 
   const response = await fetch("https://api.openai.com/v1/realtime/calls", {
     method: "POST",
@@ -71,7 +94,54 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
       "Content-Type": "application/sdp"
     }
   });
-};
+}
+
+async function createTranslationSession(env: Env) {
+  const response = await fetch("https://api.openai.com/v1/realtime/translations/client_secrets", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+      "OpenAI-Safety-Identifier": "whisper-live-pwa"
+    },
+    body: JSON.stringify(translationSessionConfig)
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    return json(
+      {
+        error: "OpenAI translation session creation failed.",
+        detail: data
+      },
+      response.status
+    );
+  }
+
+  return json(
+    {
+      mode: "translate",
+      endpoint: "https://api.openai.com/v1/realtime/translations/calls",
+      clientSecret: data
+    },
+    200
+  );
+}
+
+function getMode(request: Request, contentType: string): SessionMode {
+  const url = new URL(request.url);
+  const mode = url.searchParams.get("mode");
+
+  if (mode === "translate") {
+    return "translate";
+  }
+
+  if (mode === "transcript") {
+    return "transcript";
+  }
+
+  return contentType.includes("application/json") ? "translate" : "transcript";
+}
 
 function json(data: unknown, status: number) {
   return new Response(JSON.stringify(data), {
