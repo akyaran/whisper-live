@@ -3,31 +3,36 @@ interface Env {
 }
 
 type SessionMode = "transcript" | "translate";
+type LanguageCode = "en" | "ja";
 
-const transcriptSessionConfig = {
-  type: "transcription",
-  audio: {
-    input: {
-      transcription: {
-        model: "gpt-realtime-whisper",
-        language: "en",
-        delay: "low"
-      },
-      turn_detection: null
-    }
-  }
-};
-
-const translationSessionConfig = {
-  session: {
-    model: "gpt-realtime-translate",
+function createTranscriptSessionConfig(language: LanguageCode) {
+  return {
+    type: "transcription",
     audio: {
-      output: {
-        language: "ja"
+      input: {
+        transcription: {
+          model: "gpt-realtime-whisper",
+          language,
+          delay: "low"
+        },
+        turn_detection: null
       }
     }
-  }
-};
+  };
+}
+
+function createTranslationSessionConfig(targetLanguage: LanguageCode) {
+  return {
+    session: {
+      model: "gpt-realtime-translate",
+      audio: {
+        output: {
+          language: targetLanguage
+        }
+      }
+    }
+  };
+}
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -47,7 +52,7 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
   const mode = getMode(request, contentType);
 
   if (mode === "translate") {
-    return createTranslationSession(env);
+    return createTranslationSession(request, env);
   }
 
   return createTranscriptSession(request, env, contentType);
@@ -63,9 +68,11 @@ async function createTranscriptSession(request: Request, env: Env, contentType: 
     return json({ error: "Missing SDP offer." }, 400);
   }
 
+  const url = new URL(request.url);
+  const language = getLanguage(url.searchParams.get("language"), "en");
   const form = new FormData();
   form.set("sdp", sdp);
-  form.set("session", JSON.stringify(transcriptSessionConfig));
+  form.set("session", JSON.stringify(createTranscriptSessionConfig(language)));
 
   const response = await fetch("https://api.openai.com/v1/realtime/calls", {
     method: "POST",
@@ -96,7 +103,8 @@ async function createTranscriptSession(request: Request, env: Env, contentType: 
   });
 }
 
-async function createTranslationSession(env: Env) {
+async function createTranslationSession(request: Request, env: Env) {
+  const targetLanguage = await getTargetLanguage(request);
   const response = await fetch("https://api.openai.com/v1/realtime/translations/client_secrets", {
     method: "POST",
     headers: {
@@ -104,7 +112,7 @@ async function createTranslationSession(env: Env) {
       "Content-Type": "application/json",
       "OpenAI-Safety-Identifier": "whisper-live-pwa"
     },
-    body: JSON.stringify(translationSessionConfig)
+    body: JSON.stringify(createTranslationSessionConfig(targetLanguage))
   });
 
   const data = await response.json();
@@ -141,6 +149,19 @@ function getMode(request: Request, contentType: string): SessionMode {
   }
 
   return contentType.includes("application/json") ? "translate" : "transcript";
+}
+
+async function getTargetLanguage(request: Request): Promise<LanguageCode> {
+  try {
+    const body = (await request.json()) as { targetLanguage?: string };
+    return getLanguage(body.targetLanguage, "ja");
+  } catch {
+    return "ja";
+  }
+}
+
+function getLanguage(value: string | null | undefined, fallback: LanguageCode): LanguageCode {
+  return value === "en" || value === "ja" ? value : fallback;
 }
 
 function json(data: unknown, status: number) {

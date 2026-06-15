@@ -1,7 +1,7 @@
 {
   "name": "Whisper Live Transcript",
   "short_name": "Whisper Live",
-  "description": "English realtime transcription with OpenAI Realtime Whisper.",
+  "description": "Realtime transcription and English/Japanese live translation with OpenAI.",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#f6f2ea",

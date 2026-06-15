@@ -1,9 +1,11 @@
 import "./styles.css";
 
 type AppState = "idle" | "requesting-mic" | "connecting" | "recording" | "stopping" | "error";
-type AppMode = "transcript" | "translate";
+type AppMode = "transcript" | "en-ja" | "ja-en";
+type TranslationMode = Exclude<AppMode, "transcript">;
+type RealtimeChannel = "primary" | "source";
 
-const APP_VERSION = "v0.4.1";
+const APP_VERSION = "v0.5.0";
 
 type RealtimeEvent =
   | {
@@ -75,10 +77,30 @@ const modeCopy: Record<AppMode, { title: string; helper: string; badge: string }
     helper: "Tap start, allow the microphone, and speak English.",
     badge: "OpenAI Realtime Whisper"
   },
-  translate: {
+  "en-ja": {
     title: "English to Japanese live translation",
     helper: "Tap start, speak English, and watch Japanese translation appear.",
     badge: "OpenAI Realtime Translate"
+  },
+  "ja-en": {
+    title: "Japanese to English live translation",
+    helper: "Tap start, speak Japanese, and watch English translation appear.",
+    badge: "OpenAI Realtime Translate"
+  }
+};
+
+const translationCopy: Record<TranslationMode, { sourceLabel: string; targetLabel: string; sourceEmpty: string; targetEmpty: string }> = {
+  "en-ja": {
+    sourceLabel: "English",
+    targetLabel: "Japanese",
+    sourceEmpty: "English source will appear here.",
+    targetEmpty: "Japanese translation will appear here."
+  },
+  "ja-en": {
+    sourceLabel: "Japanese",
+    targetLabel: "English",
+    sourceEmpty: "Japanese source will appear here.",
+    targetEmpty: "English translation will appear here."
   }
 };
 
@@ -95,7 +117,7 @@ app.innerHTML = `
         <p id="modeBadge" class="eyebrow">OpenAI Realtime Whisper</p>
         <div class="title-row">
           <h1>Whisper Live</h1>
-          <span id="versionBadge" class="version-badge">v0.4.1</span>
+          <span id="versionBadge" class="version-badge">v0.5.0</span>
         </div>
       </div>
       <span id="statusBadge" class="status-badge" data-state="idle">Ready</span>
@@ -112,8 +134,12 @@ app.innerHTML = `
           <span>Transcript</span>
         </label>
         <label>
-          <input type="radio" name="mode" value="translate" />
-          <span>Translate</span>
+          <input type="radio" name="mode" value="en-ja" />
+          <span>EN → JA</span>
+        </label>
+        <label>
+          <input type="radio" name="mode" value="ja-en" />
+          <span>JA → EN</span>
         </label>
       </div>
     </section>
@@ -158,11 +184,11 @@ app.innerHTML = `
 
       <div id="translationView" class="translation-view" hidden>
         <article class="translation-column">
-          <p class="eyebrow">English</p>
+          <p id="sourceLabel" class="eyebrow">English</p>
           <div id="sourceLine" class="translation-text is-empty" aria-live="polite">English source will appear here.</div>
         </article>
         <article class="translation-column">
-          <p class="eyebrow">Japanese</p>
+          <p id="translationLabel" class="eyebrow">Japanese</p>
           <div id="translationLine" class="translation-text is-empty" aria-live="polite">Japanese translation will appear here.</div>
         </article>
       </div>
@@ -195,6 +221,8 @@ const closeFullTextButton = getElement<HTMLButtonElement>("closeFullTextButton")
 const clearButton = getElement<HTMLButtonElement>("clearButton");
 const transcriptView = getElement<HTMLDivElement>("transcriptView");
 const translationView = getElement<HTMLDivElement>("translationView");
+const sourceLabel = getElement<HTMLParagraphElement>("sourceLabel");
+const translationLabel = getElement<HTMLParagraphElement>("translationLabel");
 const sourceLine = getElement<HTMLDivElement>("sourceLine");
 const translationLine = getElement<HTMLDivElement>("translationLine");
 const fullTextPanel = getElement<HTMLElement>("fullTextPanel");
@@ -228,7 +256,7 @@ for (const input of modeInputs) {
       return;
     }
 
-    setMode(input.value === "translate" ? "translate" : "transcript");
+    setMode(input.value === "en-ja" || input.value === "ja-en" ? input.value : "transcript");
   });
 }
 
@@ -288,14 +316,14 @@ async function startRecording() {
     dc.addEventListener("open", () => {
       setState("recording");
       setHelper(
-        appMode === "translate"
-          ? "Speak naturally. English and Japanese text will stream below."
+        isTranslationMode(appMode)
+          ? "Speak naturally. Source and translation text will stream below."
           : "Speak naturally. Tap stop to finalize the current transcript."
       );
     });
 
     dc.addEventListener("message", (event) => {
-      handleRealtimeEvent(event.data);
+      handleRealtimeEvent(event.data, "primary");
     });
 
     dc.addEventListener("error", () => {
@@ -316,8 +344,9 @@ async function startRecording() {
       throw new Error("Browser did not create an SDP offer.");
     }
 
-    const answerSdp =
-      appMode === "translate" ? await createTranslationAnswer(sdp) : await createTranscriptAnswer(sdp);
+    const answerSdp = isTranslationMode(appMode)
+      ? await createTranslationAnswer(sdp, appMode)
+      : await createTranscriptAnswer(sdp, "en");
 
     await pc.setRemoteDescription({
       type: "answer",
@@ -326,8 +355,8 @@ async function startRecording() {
 
     session = { mode: appMode, pc, dc, stream };
 
-    if (appMode === "translate") {
-      const sourceSession = await createParallelSourceTranscriptSession(stream);
+    if (isTranslationMode(appMode)) {
+      const sourceSession = await createParallelSourceTranscriptSession(stream, getSourceLanguage(appMode));
       session.sourcePc = sourceSession.pc;
       session.sourceDc = sourceSession.dc;
     }
@@ -348,8 +377,8 @@ function createPeerConnection(stream: MediaStream) {
   return { pc, dc };
 }
 
-async function createTranscriptAnswer(sdp: string) {
-  const response = await fetch("/api/session?mode=transcript", {
+async function createTranscriptAnswer(sdp: string, language: "en" | "ja") {
+  const response = await fetch(`/api/session?mode=transcript&language=${language}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/sdp"
@@ -365,13 +394,13 @@ async function createTranscriptAnswer(sdp: string) {
   return answerSdp;
 }
 
-async function createTranslationAnswer(sdp: string) {
+async function createTranslationAnswer(sdp: string, mode: TranslationMode) {
   const sessionResponse = await fetch("/api/session?mode=translate", {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({ targetLanguage: "ja" })
+    body: JSON.stringify({ targetLanguage: getTargetLanguage(mode) })
   });
 
   const sessionBody = await sessionResponse.text();
@@ -406,11 +435,11 @@ async function createTranslationAnswer(sdp: string) {
   return answerSdp;
 }
 
-async function createParallelSourceTranscriptSession(stream: MediaStream) {
+async function createParallelSourceTranscriptSession(stream: MediaStream, language: "en" | "ja") {
   const { pc, dc } = createPeerConnection(stream);
 
   dc.addEventListener("message", (event) => {
-    handleRealtimeEvent(event.data);
+    handleRealtimeEvent(event.data, "source");
   });
 
   dc.addEventListener("error", () => {
@@ -430,7 +459,7 @@ async function createParallelSourceTranscriptSession(stream: MediaStream) {
     throw new Error("Browser did not create a source transcript SDP offer.");
   }
 
-  const answerSdp = await createTranscriptAnswer(offer.sdp);
+  const answerSdp = await createTranscriptAnswer(offer.sdp, language);
   await pc.setRemoteDescription({
     type: "answer",
     sdp: answerSdp
@@ -455,7 +484,7 @@ async function stopRecording() {
   if (session.dc.readyState === "open") {
     session.dc.send(
       JSON.stringify({
-        type: session.mode === "translate" ? "session.close" : "input_audio_buffer.commit"
+        type: isTranslationMode(session.mode) ? "session.close" : "input_audio_buffer.commit"
       })
     );
   }
@@ -472,7 +501,7 @@ async function stopRecording() {
   }, 1600);
 }
 
-function handleRealtimeEvent(payload: string) {
+function handleRealtimeEvent(payload: string, channel: RealtimeChannel) {
   let event: RealtimeEvent;
 
   try {
@@ -490,7 +519,11 @@ function handleRealtimeEvent(payload: string) {
     const key = lineKey(event.item_id, event.content_index);
     const delta = event.delta ?? "";
 
-    if (appMode === "translate") {
+    if (isTranslationMode(appMode)) {
+      if (channel !== "source") {
+        return;
+      }
+
       sourceText += delta;
       renderTranscript();
       return;
@@ -505,7 +538,7 @@ function handleRealtimeEvent(payload: string) {
     const key = lineKey(event.item_id, event.content_index);
     const transcript = (event.transcript ?? liveDeltas.get(key) ?? "").trim();
 
-    if (appMode === "translate") {
+    if (isTranslationMode(appMode)) {
       renderTranscript();
       return;
     }
@@ -524,12 +557,14 @@ function handleRealtimeEvent(payload: string) {
   }
 
   if (isTranslationInputDeltaEvent(event)) {
-    sourceText += event.delta ?? "";
-    renderTranscript();
     return;
   }
 
   if (isTranslationOutputDeltaEvent(event)) {
+    if (!isTranslationMode(appMode)) {
+      return;
+    }
+
     translatedText += event.delta ?? "";
     renderTranscript();
   }
@@ -564,11 +599,12 @@ function isTranslationOutputDeltaEvent(
 }
 
 function renderTranscript() {
-  if (appMode === "translate") {
+  if (isTranslationMode(appMode)) {
+    const copy = translationCopy[appMode];
     const source = sourceText.trim();
     const translation = translatedText.trim();
-    sourceLine.textContent = source || "English source will appear here.";
-    translationLine.textContent = translation || "Japanese translation will appear here.";
+    sourceLine.textContent = source || copy.sourceEmpty;
+    translationLine.textContent = translation || copy.targetEmpty;
     sourceLine.classList.toggle("is-empty", !source);
     translationLine.classList.toggle("is-empty", !translation);
     scrollToLatest(sourceLine);
@@ -600,8 +636,14 @@ function setMode(nextMode: AppMode) {
   appMode = nextMode;
   modeBadge.textContent = modeCopy[nextMode].badge;
   recorderTitle.textContent = modeCopy[nextMode].title;
-  transcriptView.hidden = nextMode === "translate";
+  transcriptView.hidden = isTranslationMode(nextMode);
   translationView.hidden = nextMode === "transcript";
+
+  if (isTranslationMode(nextMode)) {
+    const copy = translationCopy[nextMode];
+    sourceLabel.textContent = copy.sourceLabel;
+    translationLabel.textContent = copy.targetLabel;
+  }
 
   for (const input of modeInputs) {
     input.checked = input.value === nextMode;
@@ -714,7 +756,7 @@ function downloadTranscript() {
   const blob = new Blob([transcript, "\n"], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
-  const suffix = appMode === "translate" ? "translation" : "transcript";
+  const suffix = isTranslationMode(appMode) ? appMode : "transcript";
   link.href = url;
   link.download = `whisper-live-${suffix}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`;
   link.click();
@@ -722,7 +764,8 @@ function downloadTranscript() {
 }
 
 function getTranscriptText() {
-  if (appMode === "translate") {
+  if (isTranslationMode(appMode)) {
+    const copy = translationCopy[appMode];
     const source = sourceText.trim();
     const translation = translatedText.trim();
 
@@ -730,7 +773,9 @@ function getTranscriptText() {
       return "";
     }
 
-    return [`English:\n${source || "(empty)"}`, `Japanese:\n${translation || "(empty)"}`].join("\n\n");
+    return [`${copy.sourceLabel}:\n${source || "(empty)"}`, `${copy.targetLabel}:\n${translation || "(empty)"}`].join(
+      "\n\n"
+    );
   }
 
   return [...finalLines.values()]
@@ -738,6 +783,18 @@ function getTranscriptText() {
     .map((line) => line.text)
     .join("\n")
     .trim();
+}
+
+function isTranslationMode(mode: AppMode): mode is TranslationMode {
+  return mode === "en-ja" || mode === "ja-en";
+}
+
+function getSourceLanguage(mode: TranslationMode) {
+  return mode === "en-ja" ? "en" : "ja";
+}
+
+function getTargetLanguage(mode: TranslationMode) {
+  return mode === "en-ja" ? "ja" : "en";
 }
 
 function readApiError(text: string) {

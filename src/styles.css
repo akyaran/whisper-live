@@ -142,9 +142,9 @@ h2 {
 
 .mode-toggle {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
-  width: min(100%, 320px);
+  width: min(100%, 440px);
   padding: 4px;
   border: 1px solid #d7c9ae;
   border-radius: 8px;
@@ -166,7 +166,7 @@ h2 {
   align-items: center;
   justify-content: center;
   min-height: 40px;
-  padding: 0 10px;
+  padding: 0 8px;
   border-radius: 6px;
   color: #576565;
   font-weight: 850;

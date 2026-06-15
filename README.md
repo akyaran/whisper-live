@@ -8,7 +8,7 @@ Cloudflare Pages + Pages Functions + PWA for English realtime transcription with
 - Uses WebRTC for low-latency microphone audio.
 - Sends the OpenAI API key only from Cloudflare Pages Functions.
 - Shows live transcript deltas and final transcript lines.
-- Switches between English-only transcription and English-to-Japanese live translation.
+- Switches between English-only transcription, English-to-Japanese translation, and Japanese-to-English translation.
 - Keeps the live view to the latest few lines while retaining a full transcript panel.
 - Supports copy, clear, and `.txt` download.
 
@@ -51,6 +51,6 @@ Build first so `dist` exists, then open the local Wrangler URL.
 ## Notes
 
 - `Transcript` mode is English-only through `audio.input.transcription.language: "en"`.
-- `Translate` mode uses `gpt-realtime-translate` for Japanese and a parallel `gpt-realtime-whisper` session for the English source text.
+- Translation modes use `gpt-realtime-translate` for the target language and a parallel `gpt-realtime-whisper` session for the source text.
 - Transcripts are kept only in the browser session. They are not stored server-side.
 - The initial transcription delay is `low`. If you want faster partials, try `minimal`; if you want steadier accuracy, try `medium`, `high`, or `xhigh` in `functions/api/session.ts`.
