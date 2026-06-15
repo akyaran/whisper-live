@@ -3,7 +3,7 @@ import "./styles.css";
 type AppState = "idle" | "requesting-mic" | "connecting" | "recording" | "stopping" | "error";
 type AppMode = "transcript" | "translate";
 
-const APP_VERSION = "v0.4.0";
+const APP_VERSION = "v0.4.1";
 
 type RealtimeEvent =
   | {
@@ -95,7 +95,7 @@ app.innerHTML = `
         <p id="modeBadge" class="eyebrow">OpenAI Realtime Whisper</p>
         <div class="title-row">
           <h1>Whisper Live</h1>
-          <span id="versionBadge" class="version-badge">v0.4.0</span>
+          <span id="versionBadge" class="version-badge">v0.4.1</span>
         </div>
       </div>
       <span id="statusBadge" class="status-badge" data-state="idle">Ready</span>
