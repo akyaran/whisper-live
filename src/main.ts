@@ -53,6 +53,8 @@ interface SessionResources {
   mode: AppMode;
   pc: RTCPeerConnection;
   dc: RTCDataChannel;
+  sourcePc?: RTCPeerConnection;
+  sourceDc?: RTCDataChannel;
   stream: MediaStream;
 }
 
@@ -155,7 +157,7 @@ app.innerHTML = `
         </article>
         <article class="translation-column">
           <p class="eyebrow">Japanese</p>
-          <div id="translationLine" class="translation-text is-empty" aria-live="polite">日本語訳がここに表示されます。</div>
+          <div id="translationLine" class="translation-text is-empty" aria-live="polite">Japanese translation will appear here.</div>
         </article>
       </div>
     </section>
@@ -252,12 +254,7 @@ async function startRecording() {
     setState("connecting");
     setHelper("Opening a secure realtime session.");
 
-    const pc = new RTCPeerConnection();
-    const dc = pc.createDataChannel("oai-events");
-
-    for (const track of stream.getAudioTracks()) {
-      pc.addTrack(track, stream);
-    }
+    const { pc, dc } = createPeerConnection(stream);
 
     dc.addEventListener("open", () => {
       setState("recording");
@@ -299,10 +296,27 @@ async function startRecording() {
     });
 
     session = { mode: appMode, pc, dc, stream };
+
+    if (appMode === "translate") {
+      const sourceSession = await createParallelSourceTranscriptSession(stream);
+      session.sourcePc = sourceSession.pc;
+      session.sourceDc = sourceSession.dc;
+    }
   } catch (error) {
     closeSession();
     showError(error instanceof Error ? error.message : "Could not start recording.");
   }
+}
+
+function createPeerConnection(stream: MediaStream) {
+  const pc = new RTCPeerConnection();
+  const dc = pc.createDataChannel("oai-events");
+
+  for (const track of stream.getAudioTracks()) {
+    pc.addTrack(track, stream);
+  }
+
+  return { pc, dc };
 }
 
 async function createTranscriptAnswer(sdp: string) {
@@ -363,6 +377,39 @@ async function createTranslationAnswer(sdp: string) {
   return answerSdp;
 }
 
+async function createParallelSourceTranscriptSession(stream: MediaStream) {
+  const { pc, dc } = createPeerConnection(stream);
+
+  dc.addEventListener("message", (event) => {
+    handleRealtimeEvent(event.data);
+  });
+
+  dc.addEventListener("error", () => {
+    showError("Source transcript data channel reported an error.");
+  });
+
+  pc.addEventListener("connectionstatechange", () => {
+    if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+      showError("Source transcript connection was interrupted.");
+    }
+  });
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  if (!offer.sdp) {
+    throw new Error("Browser did not create a source transcript SDP offer.");
+  }
+
+  const answerSdp = await createTranscriptAnswer(offer.sdp);
+  await pc.setRemoteDescription({
+    type: "answer",
+    sdp: answerSdp
+  });
+
+  return { pc, dc };
+}
+
 async function stopRecording() {
   if (!session) {
     setState("idle");
@@ -382,6 +429,10 @@ async function stopRecording() {
         type: session.mode === "translate" ? "session.close" : "input_audio_buffer.commit"
       })
     );
+  }
+
+  if (session.sourceDc?.readyState === "open") {
+    session.sourceDc.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
   }
 
   window.clearTimeout(stopTimer);
@@ -408,7 +459,15 @@ function handleRealtimeEvent(payload: string) {
 
   if (isTranscriptDeltaEvent(event)) {
     const key = lineKey(event.item_id, event.content_index);
-    liveDeltas.set(key, `${liveDeltas.get(key) ?? ""}${event.delta ?? ""}`);
+    const delta = event.delta ?? "";
+
+    if (appMode === "translate") {
+      sourceText += delta;
+      renderTranscript();
+      return;
+    }
+
+    liveDeltas.set(key, `${liveDeltas.get(key) ?? ""}${delta}`);
     renderTranscript();
     return;
   }
@@ -416,6 +475,11 @@ function handleRealtimeEvent(payload: string) {
   if (isTranscriptCompletedEvent(event)) {
     const key = lineKey(event.item_id, event.content_index);
     const transcript = (event.transcript ?? liveDeltas.get(key) ?? "").trim();
+
+    if (appMode === "translate") {
+      renderTranscript();
+      return;
+    }
 
     if (transcript) {
       finalLines.set(key, {
@@ -475,7 +539,7 @@ function renderTranscript() {
     const source = sourceText.trim();
     const translation = translatedText.trim();
     sourceLine.textContent = source || "English source will appear here.";
-    translationLine.textContent = translation || "日本語訳がここに表示されます。";
+    translationLine.textContent = translation || "Japanese translation will appear here.";
     sourceLine.classList.toggle("is-empty", !source);
     translationLine.classList.toggle("is-empty", !translation);
     return;
@@ -553,6 +617,12 @@ function closeSession() {
   }
 
   session.pc.close();
+
+  if (session.sourceDc && session.sourceDc.readyState !== "closed") {
+    session.sourceDc.close();
+  }
+
+  session.sourcePc?.close();
   session = null;
 }
 

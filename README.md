@@ -50,6 +50,6 @@ Build first so `dist` exists, then open the local Wrangler URL.
 ## Notes
 
 - `Transcript` mode is English-only through `audio.input.transcription.language: "en"`.
-- `Translate` mode uses `gpt-realtime-translate` and outputs Japanese text through `audio.output.language: "ja"`.
+- `Translate` mode uses `gpt-realtime-translate` for Japanese and a parallel `gpt-realtime-whisper` session for the English source text.
 - Transcripts are kept only in the browser session. They are not stored server-side.
 - The initial transcription delay is `low`. If you want faster partials, try `minimal`; if you want steadier accuracy, try `medium`, `high`, or `xhigh` in `functions/api/session.ts`.
