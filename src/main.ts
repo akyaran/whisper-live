@@ -3,11 +3,14 @@ import "./styles.css";
 type AppState = "idle" | "requesting-mic" | "connecting" | "recording" | "stopping" | "error";
 type AppMode = "transcript" | "en-ja" | "ja-en";
 type TranslationMode = Exclude<AppMode, "transcript">;
-type RealtimeChannel = "primary" | "source";
 
-const APP_VERSION = "v0.7.3";
+const APP_VERSION = "v0.7.4";
 const AUTOSAVE_INTERVAL_MS = 60_000;
-const TRANSCRIPT_COMMIT_INTERVAL_MS = 30_000;
+const TRANSCRIPT_WATCHDOG_INTERVAL_MS = 1_000;
+const TRANSCRIPT_STALL_MS = 18_000;
+const TRANSCRIPT_AUDIO_RECENT_MS = 4_000;
+const TRANSCRIPT_RECONNECT_COOLDOWN_MS = 15_000;
+const AUDIO_ACTIVITY_THRESHOLD = 0.012;
 const DRAFT_DB_NAME = "whisper-live-drafts";
 const DRAFT_STORE_NAME = "drafts";
 const HISTORY_STORE_NAME = "history";
@@ -65,9 +68,15 @@ interface SessionResources {
   mode: AppMode;
   pc: RTCPeerConnection;
   dc: RTCDataChannel;
-  sourcePc?: RTCPeerConnection;
-  sourceDc?: RTCDataChannel;
   stream: MediaStream;
+}
+
+interface AudioMonitor {
+  context: AudioContext;
+  source: MediaStreamAudioSourceNode;
+  analyser: AnalyserNode;
+  data: Uint8Array;
+  timer: number;
 }
 
 interface SavedTranscriptDraft {
@@ -300,12 +309,17 @@ let sourceText = "";
 let translatedText = "";
 let stopTimer: number | undefined;
 let autosaveTimer: number | undefined;
-let transcriptCommitTimer: number | undefined;
+let transcriptWatchdogTimer: number | undefined;
 let wakeLock: WakeLockSentinel | null = null;
 let wakeLockActive = false;
 let lastSavedAt = 0;
 let activeHistorySaved = false;
 let historyItems: SavedTranscriptHistory[] = [];
+let audioMonitor: AudioMonitor | null = null;
+let lastAudioActivityAt = 0;
+let lastTranscriptEventAt = 0;
+let lastTranscriptReconnectAt = 0;
+let reconnectingTranscript = false;
 
 recordButton.addEventListener("click", () => {
   if (state === "recording") {
@@ -397,40 +411,25 @@ async function startRecording() {
         autoGainControl: true
       }
     });
+    setupAudioMonitor(stream);
 
     setState("connecting");
     setHelper("Opening a secure realtime session.");
 
     const { pc, dc } = createPeerConnection(stream);
 
-    dc.addEventListener("open", () => {
+    attachPrimaryRealtimeListeners(pc, dc, () => {
       setState("recording");
       setHelper(
         isTranslationMode(appMode)
           ? "Speak naturally. Source and translation text will stream below."
           : "Speak naturally. Tap stop to finalize the current transcript."
       );
+      lastTranscriptEventAt = Date.now();
+      lastTranscriptReconnectAt = 0;
       startAutosaveTimer();
-      startTranscriptCommitTimer();
+      startTranscriptWatchdog();
       void requestWakeLock();
-    });
-
-    dc.addEventListener("message", (event) => {
-      handleRealtimeEvent(event.data, "primary");
-    });
-
-    dc.addEventListener("error", () => {
-      showError("Realtime data channel reported an error.");
-    });
-
-    dc.addEventListener("close", () => {
-      handleDataChannelClose("Realtime");
-    });
-
-    pc.addEventListener("connectionstatechange", () => {
-      if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
-        showError("Realtime connection was interrupted.");
-      }
     });
 
     const offer = await pc.createOffer();
@@ -451,16 +450,34 @@ async function startRecording() {
     });
 
     session = { mode: appMode, pc, dc, stream };
-
-    if (isTranslationMode(appMode)) {
-      const sourceSession = await createParallelSourceTranscriptSession(stream, getSourceLanguage(appMode));
-      session.sourcePc = sourceSession.pc;
-      session.sourceDc = sourceSession.dc;
-    }
   } catch (error) {
     closeSession();
     showError(error instanceof Error ? error.message : "Could not start recording.");
   }
+}
+
+function attachPrimaryRealtimeListeners(pc: RTCPeerConnection, dc: RTCDataChannel, onOpen?: () => void) {
+  dc.addEventListener("open", () => {
+    onOpen?.();
+  });
+
+  dc.addEventListener("message", (event) => {
+    handleRealtimeEvent(event.data);
+  });
+
+  dc.addEventListener("error", () => {
+    showError("Realtime data channel reported an error.");
+  });
+
+  dc.addEventListener("close", () => {
+    handleDataChannelClose("Realtime");
+  });
+
+  pc.addEventListener("connectionstatechange", () => {
+    if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+      handleConnectionInterruption("Realtime");
+    }
+  });
 }
 
 function createPeerConnection(stream: MediaStream) {
@@ -532,43 +549,6 @@ async function createTranslationAnswer(sdp: string, mode: TranslationMode) {
   return answerSdp;
 }
 
-async function createParallelSourceTranscriptSession(stream: MediaStream, language: "en" | "ja") {
-  const { pc, dc } = createPeerConnection(stream);
-
-  dc.addEventListener("message", (event) => {
-    handleRealtimeEvent(event.data, "source");
-  });
-
-  dc.addEventListener("error", () => {
-    showError("Source transcript data channel reported an error.");
-  });
-
-  dc.addEventListener("close", () => {
-    handleDataChannelClose("Source transcript");
-  });
-
-  pc.addEventListener("connectionstatechange", () => {
-    if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
-      showError("Source transcript connection was interrupted.");
-    }
-  });
-
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-
-  if (!offer.sdp) {
-    throw new Error("Browser did not create a source transcript SDP offer.");
-  }
-
-  const answerSdp = await createTranscriptAnswer(offer.sdp, language);
-  await pc.setRemoteDescription({
-    type: "answer",
-    sdp: answerSdp
-  });
-
-  return { pc, dc };
-}
-
 async function stopRecording() {
   if (!session) {
     setState("idle");
@@ -578,7 +558,7 @@ async function stopRecording() {
   setState("stopping");
   setHelper("Finalizing the last words.");
   stopAutosaveTimer();
-  stopTranscriptCommitTimer();
+  stopTranscriptWatchdog();
   void saveTranscriptDraft();
   void releaseWakeLock();
 
@@ -596,10 +576,6 @@ async function stopRecording() {
 
   commitTranscriptBuffer();
 
-  if (session.sourceDc?.readyState === "open") {
-    session.sourceDc.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-  }
-
   window.clearTimeout(stopTimer);
   stopTimer = window.setTimeout(() => {
     void saveTranscriptDraft();
@@ -610,7 +586,7 @@ async function stopRecording() {
   }, 1600);
 }
 
-function handleRealtimeEvent(payload: string, channel: RealtimeChannel) {
+function handleRealtimeEvent(payload: string) {
   let event: RealtimeEvent;
 
   try {
@@ -625,18 +601,9 @@ function handleRealtimeEvent(payload: string, channel: RealtimeChannel) {
   }
 
   if (isTranscriptDeltaEvent(event)) {
+    lastTranscriptEventAt = Date.now();
     const key = lineKey(event.item_id, event.content_index);
     const delta = event.delta ?? "";
-
-    if (isTranslationMode(appMode)) {
-      if (channel !== "source") {
-        return;
-      }
-
-      sourceText += delta;
-      renderTranscript();
-      return;
-    }
 
     liveDeltas.set(key, `${liveDeltas.get(key) ?? ""}${delta}`);
     renderTranscript();
@@ -644,13 +611,9 @@ function handleRealtimeEvent(payload: string, channel: RealtimeChannel) {
   }
 
   if (isTranscriptCompletedEvent(event)) {
+    lastTranscriptEventAt = Date.now();
     const key = lineKey(event.item_id, event.content_index);
     const transcript = (event.transcript ?? liveDeltas.get(key) ?? "").trim();
-
-    if (isTranslationMode(appMode)) {
-      renderTranscript();
-      return;
-    }
 
     if (transcript) {
       finalLines.set(key, {
@@ -666,10 +629,18 @@ function handleRealtimeEvent(payload: string, channel: RealtimeChannel) {
   }
 
   if (isTranslationInputDeltaEvent(event)) {
+    lastTranscriptEventAt = Date.now();
+    if (!isTranslationMode(appMode)) {
+      return;
+    }
+
+    sourceText += event.delta ?? "";
+    renderTranscript();
     return;
   }
 
   if (isTranslationOutputDeltaEvent(event)) {
+    lastTranscriptEventAt = Date.now();
     if (!isTranslationMode(appMode)) {
       return;
     }
@@ -792,21 +763,40 @@ function showError(message: string) {
   setState("error");
   setHelper(message);
   stopAutosaveTimer();
-  stopTranscriptCommitTimer();
+  stopTranscriptWatchdog();
   void saveTranscriptDraft();
   void releaseWakeLock();
 }
 
 function handleDataChannelClose(label: string) {
+  if (reconnectingTranscript) {
+    return;
+  }
+
   if (state === "recording" || state === "connecting" || state === "requesting-mic") {
+    if (session?.mode === "transcript" && state === "recording") {
+      void reconnectTranscriptSession(`${label} channel closed`);
+      return;
+    }
+
     showError(`${label} connection closed unexpectedly.`);
   }
+}
+
+function handleConnectionInterruption(label: string) {
+  if (session?.mode === "transcript" && state === "recording") {
+    void reconnectTranscriptSession(`${label} connection interrupted`);
+    return;
+  }
+
+  showError(`${label} connection was interrupted.`);
 }
 
 function closeSession() {
   window.clearTimeout(stopTimer);
   stopAutosaveTimer();
-  stopTranscriptCommitTimer();
+  stopTranscriptWatchdog();
+  stopAudioMonitor();
   void releaseWakeLock();
 
   if (!session) {
@@ -822,12 +812,6 @@ function closeSession() {
   }
 
   session.pc.close();
-
-  if (session.sourceDc && session.sourceDc.readyState !== "closed") {
-    session.sourceDc.close();
-  }
-
-  session.sourcePc?.close();
   session = null;
 }
 
@@ -854,21 +838,21 @@ function stopAutosaveTimer() {
   autosaveTimer = undefined;
 }
 
-function startTranscriptCommitTimer() {
-  stopTranscriptCommitTimer();
+function startTranscriptWatchdog() {
+  stopTranscriptWatchdog();
 
   if (isTranslationMode(appMode)) {
     return;
   }
 
-  transcriptCommitTimer = window.setInterval(() => {
-    commitTranscriptBuffer();
-  }, TRANSCRIPT_COMMIT_INTERVAL_MS);
+  transcriptWatchdogTimer = window.setInterval(() => {
+    checkTranscriptHealth();
+  }, TRANSCRIPT_WATCHDOG_INTERVAL_MS);
 }
 
-function stopTranscriptCommitTimer() {
-  window.clearInterval(transcriptCommitTimer);
-  transcriptCommitTimer = undefined;
+function stopTranscriptWatchdog() {
+  window.clearInterval(transcriptWatchdogTimer);
+  transcriptWatchdogTimer = undefined;
 }
 
 function commitTranscriptBuffer() {
@@ -877,6 +861,123 @@ function commitTranscriptBuffer() {
   }
 
   session.dc.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+}
+
+function setupAudioMonitor(stream: MediaStream) {
+  stopAudioMonitor();
+
+  try {
+    const context = new AudioContext();
+    const source = context.createMediaStreamSource(stream);
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 512;
+    const data = new Uint8Array(analyser.fftSize);
+    source.connect(analyser);
+
+    const timer = window.setInterval(() => {
+      analyser.getByteTimeDomainData(data);
+      let sumSquares = 0;
+
+      for (const sample of data) {
+        const centered = (sample - 128) / 128;
+        sumSquares += centered * centered;
+      }
+
+      const rms = Math.sqrt(sumSquares / data.length);
+      if (rms > AUDIO_ACTIVITY_THRESHOLD) {
+        lastAudioActivityAt = Date.now();
+      }
+    }, 250);
+
+    audioMonitor = { context, source, analyser, data, timer };
+  } catch {
+    audioMonitor = null;
+    lastAudioActivityAt = 0;
+  }
+}
+
+function stopAudioMonitor() {
+  if (!audioMonitor) {
+    return;
+  }
+
+  window.clearInterval(audioMonitor.timer);
+  audioMonitor.source.disconnect();
+  void audioMonitor.context.close();
+  audioMonitor = null;
+  lastAudioActivityAt = 0;
+}
+
+function checkTranscriptHealth() {
+  if (!session || session.mode !== "transcript" || state !== "recording" || reconnectingTranscript) {
+    return;
+  }
+
+  const now = Date.now();
+  const audioIsActive = lastAudioActivityAt > 0 && now - lastAudioActivityAt <= TRANSCRIPT_AUDIO_RECENT_MS;
+  const transcriptIsStale = lastTranscriptEventAt > 0 && now - lastTranscriptEventAt >= TRANSCRIPT_STALL_MS;
+  const reconnectIsAllowed = now - lastTranscriptReconnectAt >= TRANSCRIPT_RECONNECT_COOLDOWN_MS;
+
+  if (audioIsActive && transcriptIsStale && reconnectIsAllowed) {
+    void reconnectTranscriptSession("transcript stalled after audio resumed");
+  }
+}
+
+async function reconnectTranscriptSession(reason: string) {
+  if (!session || session.mode !== "transcript" || state !== "recording" || reconnectingTranscript) {
+    return;
+  }
+
+  const now = Date.now();
+  if (now - lastTranscriptReconnectAt < TRANSCRIPT_RECONNECT_COOLDOWN_MS) {
+    return;
+  }
+
+  reconnectingTranscript = true;
+  lastTranscriptReconnectAt = now;
+  lastTranscriptEventAt = now;
+  setHelper(`Reconnecting transcript: ${reason}.`);
+  updateSessionNote();
+
+  try {
+    const currentSession = session;
+    closePrimaryConnection(currentSession);
+
+    const { pc, dc } = createPeerConnection(currentSession.stream);
+    attachPrimaryRealtimeListeners(pc, dc, () => {
+      setHelper("Transcript reconnected. Keep speaking.");
+      lastTranscriptEventAt = Date.now();
+    });
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    if (!offer.sdp) {
+      throw new Error("Browser did not create a reconnect SDP offer.");
+    }
+
+    const answerSdp = await createTranscriptAnswer(offer.sdp, "en");
+    await pc.setRemoteDescription({
+      type: "answer",
+      sdp: answerSdp
+    });
+
+    currentSession.pc = pc;
+    currentSession.dc = dc;
+  } catch (error) {
+    showError(error instanceof Error ? error.message : "Transcript reconnect failed.");
+  } finally {
+    reconnectingTranscript = false;
+    updateSessionNote();
+  }
+}
+
+function closePrimaryConnection(resources: SessionResources) {
+  if (resources.dc.readyState !== "closed") {
+    resources.dc.close();
+  }
+
+  resources.pc.close();
 }
 
 async function saveTranscriptDraft() {
@@ -1099,6 +1200,10 @@ function updateSessionNote() {
     messages.push("Screen awake while recording");
   } else if (state === "recording") {
     messages.push("Keep this screen open while recording");
+  }
+
+  if (reconnectingTranscript) {
+    messages.push("Reconnecting transcript");
   }
 
   if (lastSavedAt > 0) {
@@ -1434,10 +1539,6 @@ function isTranslationMode(mode: AppMode): mode is TranslationMode {
 
 function isAppMode(mode: string): mode is AppMode {
   return mode === "transcript" || mode === "en-ja" || mode === "ja-en";
-}
-
-function getSourceLanguage(mode: TranslationMode) {
-  return mode === "en-ja" ? "en" : "ja";
 }
 
 function getTargetLanguage(mode: TranslationMode) {

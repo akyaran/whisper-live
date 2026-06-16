@@ -54,10 +54,10 @@ Build first so `dist` exists, then open the local Wrangler URL.
 ## Notes
 
 - `Transcript` mode is English-only through `audio.input.transcription.language: "en"`.
-- Translation modes use `gpt-realtime-translate` for the target language and a parallel `gpt-realtime-whisper` session for the source text.
+- Translation modes use a single `gpt-realtime-translate` session for both source transcript and translated text.
 - Transcripts are kept only in the browser session. They are not stored server-side.
 - Autosaved transcripts are stored only on the current device and are cleared by the `Clear` button.
 - Transcript history is stored only on the current device and can be deleted item-by-item or all at once.
 - Screen wake lock reduces accidental auto-lock during recording, but manual lock or browser backgrounding can still stop capture.
-- Transcript mode commits the audio buffer every 30 seconds while recording to keep long sessions moving.
+- Transcript mode watches microphone activity and reconnects the Realtime session if audio resumes but transcript events stop arriving.
 - The initial transcription delay is `low`. If you want faster partials, try `minimal`; if you want steadier accuracy, try `medium`, `high`, or `xhigh` in `functions/api/session.ts`.
