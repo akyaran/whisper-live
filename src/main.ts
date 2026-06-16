@@ -4,7 +4,7 @@ type AppState = "idle" | "requesting-mic" | "connecting" | "recording" | "stoppi
 type AppMode = "transcript" | "en-ja" | "ja-en";
 type TranslationMode = Exclude<AppMode, "transcript">;
 
-const APP_VERSION = "v0.8.0";
+const APP_VERSION = "v0.8.1";
 const AUTOSAVE_INTERVAL_MS = 60_000;
 const TRANSCRIPT_WATCHDOG_INTERVAL_MS = 1_000;
 const TRANSCRIPT_STALL_MS = 18_000;
@@ -313,6 +313,8 @@ let finalLines = new Map<string, FinalLine>();
 let liveDeltas = new Map<string, string>();
 let sourceText = "";
 let translatedText = "";
+let sourceTextEventSource: "input" | "output" | null = null;
+let transcriptTextEventSource: "input" | "output" | null = null;
 let stopTimer: number | undefined;
 let autosaveTimer: number | undefined;
 let transcriptWatchdogTimer: number | undefined;
@@ -665,6 +667,19 @@ function handleRealtimeEvent(payload: string, channel: "primary" | "source" = "p
 
   if (isTranslationInputDeltaEvent(event)) {
     lastTranscriptEventAt = Date.now();
+    const text = getRealtimeText(event);
+
+    if (appMode === "transcript") {
+      appendTranscriptText(text, "input");
+      renderTranscript();
+      return;
+    }
+
+    if (channel === "source" && isTranslationMode(appMode)) {
+      appendSourceText(text, "input");
+      renderTranscript();
+    }
+
     return;
   }
 
@@ -673,13 +688,13 @@ function handleRealtimeEvent(payload: string, channel: "primary" | "source" = "p
     const text = getRealtimeText(event);
 
     if (appMode === "transcript") {
-      appendTranscriptText(text);
+      appendTranscriptText(text, "output");
       renderTranscript();
       return;
     }
 
     if (channel === "source") {
-      sourceText += text;
+      appendSourceText(text, "output");
       renderTranscript();
       return;
     }
@@ -726,13 +741,40 @@ function getRealtimeText(event: RealtimeEvent) {
   return candidate.delta ?? candidate.transcript ?? candidate.text ?? "";
 }
 
-function appendTranscriptText(text: string) {
+function appendTranscriptText(text: string, eventSource: "input" | "output") {
   if (!text) {
     return;
   }
 
   const key = "translate-transcript";
+
+  if (transcriptTextEventSource && transcriptTextEventSource !== eventSource) {
+    if (transcriptTextEventSource === "input") {
+      return;
+    }
+
+    liveDeltas.delete(key);
+  }
+
+  transcriptTextEventSource = eventSource;
   liveDeltas.set(key, `${liveDeltas.get(key) ?? ""}${text}`);
+}
+
+function appendSourceText(text: string, eventSource: "input" | "output") {
+  if (!text) {
+    return;
+  }
+
+  if (sourceTextEventSource && sourceTextEventSource !== eventSource) {
+    if (sourceTextEventSource === "input") {
+      return;
+    }
+
+    sourceText = "";
+  }
+
+  sourceTextEventSource = eventSource;
+  sourceText += text;
 }
 
 function closeTranslationDataChannel(dc: RTCDataChannel | undefined) {
@@ -895,6 +937,8 @@ function clearTranscript() {
   liveDeltas = new Map();
   sourceText = "";
   translatedText = "";
+  sourceTextEventSource = null;
+  transcriptTextEventSource = null;
   lastSavedAt = 0;
   renderTranscript();
   void clearTranscriptDraft();
@@ -1088,6 +1132,8 @@ async function restoreTranscriptDraft() {
 
   sourceText = draft.sourceText;
   translatedText = draft.translatedText;
+  sourceTextEventSource = null;
+  transcriptTextEventSource = draft.liveText ? "output" : null;
   lastSavedAt = draft.savedAt;
   renderTranscript();
   setHelper("Restored your saved transcript from this device.");
