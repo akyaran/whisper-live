@@ -5,7 +5,12 @@ type AppMode = "transcript" | "en-ja" | "ja-en";
 type TranslationMode = Exclude<AppMode, "transcript">;
 type RealtimeChannel = "primary" | "source";
 
-const APP_VERSION = "v0.5.0";
+const APP_VERSION = "v0.6.0";
+const AUTOSAVE_INTERVAL_MS = 60_000;
+const DRAFT_DB_NAME = "whisper-live-drafts";
+const DRAFT_STORE_NAME = "drafts";
+const DRAFT_ID = "current";
+const DRAFT_STORAGE_KEY = "whisper-live-current-draft";
 
 type RealtimeEvent =
   | {
@@ -62,6 +67,29 @@ interface SessionResources {
   stream: MediaStream;
 }
 
+interface SavedTranscriptDraft {
+  id: typeof DRAFT_ID;
+  mode: AppMode;
+  savedAt: number;
+  finalLines: FinalLine[];
+  liveText: string;
+  sourceText: string;
+  translatedText: string;
+}
+
+interface WakeLockSentinel extends EventTarget {
+  released: boolean;
+  release(): Promise<void>;
+}
+
+interface WakeLock {
+  request(type: "screen"): Promise<WakeLockSentinel>;
+}
+
+type NavigatorWithWakeLock = Navigator & {
+  wakeLock?: WakeLock;
+};
+
 const statusCopy: Record<AppState, string> = {
   idle: "Ready",
   "requesting-mic": "Waiting for microphone",
@@ -117,7 +145,7 @@ app.innerHTML = `
         <p id="modeBadge" class="eyebrow">OpenAI Realtime Whisper</p>
         <div class="title-row">
           <h1>Whisper Live</h1>
-          <span id="versionBadge" class="version-badge">v0.5.0</span>
+          <span id="versionBadge" class="version-badge">v0.6.0</span>
         </div>
       </div>
       <span id="statusBadge" class="status-badge" data-state="idle">Ready</span>
@@ -155,6 +183,7 @@ app.innerHTML = `
       <div>
         <h2 id="recorderTitle">English realtime transcript</h2>
         <p id="helperText">Tap start, allow the microphone, and speak English.</p>
+        <p id="sessionNote" class="session-note"></p>
       </div>
       <button id="recordButton" class="record-button" type="button">
         <span class="record-dot" aria-hidden="true"></span>
@@ -211,6 +240,7 @@ const recordButton = getElement<HTMLButtonElement>("recordButton");
 const recordButtonText = getElement<HTMLSpanElement>("recordButtonText");
 const statusBadge = getElement<HTMLSpanElement>("statusBadge");
 const helperText = getElement<HTMLParagraphElement>("helperText");
+const sessionNote = getElement<HTMLParagraphElement>("sessionNote");
 const liveLine = getElement<HTMLDivElement>("liveLine");
 const finalList = getElement<HTMLOListElement>("finalList");
 const emptyState = getElement<HTMLParagraphElement>("emptyState");
@@ -238,6 +268,10 @@ let liveDeltas = new Map<string, string>();
 let sourceText = "";
 let translatedText = "";
 let stopTimer: number | undefined;
+let autosaveTimer: number | undefined;
+let wakeLock: WakeLockSentinel | null = null;
+let wakeLockActive = false;
+let lastSavedAt = 0;
 
 recordButton.addEventListener("click", () => {
   if (state === "recording") {
@@ -279,7 +313,14 @@ closeFullTextButton.addEventListener("click", () => {
 });
 
 window.addEventListener("beforeunload", () => {
+  void saveTranscriptDraft();
   closeSession();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && state === "recording") {
+    void requestWakeLock();
+  }
 });
 
 if ("serviceWorker" in navigator) {
@@ -291,7 +332,8 @@ if ("serviceWorker" in navigator) {
 }
 
 versionBadge.textContent = APP_VERSION;
-setMode("transcript");
+setMode("transcript", { clear: false });
+void restoreTranscriptDraft();
 
 async function startRecording() {
   setState("requesting-mic");
@@ -320,6 +362,8 @@ async function startRecording() {
           ? "Speak naturally. Source and translation text will stream below."
           : "Speak naturally. Tap stop to finalize the current transcript."
       );
+      startAutosaveTimer();
+      void requestWakeLock();
     });
 
     dc.addEventListener("message", (event) => {
@@ -476,6 +520,9 @@ async function stopRecording() {
 
   setState("stopping");
   setHelper("Finalizing the last words.");
+  stopAutosaveTimer();
+  void saveTranscriptDraft();
+  void releaseWakeLock();
 
   for (const track of session.stream.getAudioTracks()) {
     track.stop();
@@ -632,7 +679,7 @@ function renderTranscript() {
   renderFullText();
 }
 
-function setMode(nextMode: AppMode) {
+function setMode(nextMode: AppMode, options: { clear: boolean } = { clear: true }) {
   appMode = nextMode;
   modeBadge.textContent = modeCopy[nextMode].badge;
   recorderTitle.textContent = modeCopy[nextMode].title;
@@ -649,7 +696,12 @@ function setMode(nextMode: AppMode) {
     input.checked = input.value === nextMode;
   }
 
-  clearTranscript();
+  if (options.clear) {
+    clearTranscript();
+  } else {
+    renderTranscript();
+  }
+
   setHelper(modeCopy[nextMode].helper);
 }
 
@@ -666,6 +718,8 @@ function setState(nextState: AppState) {
   for (const input of modeInputs) {
     input.disabled = nextState !== "idle" && nextState !== "error";
   }
+
+  updateSessionNote();
 }
 
 function setHelper(message: string) {
@@ -675,10 +729,15 @@ function setHelper(message: string) {
 function showError(message: string) {
   setState("error");
   setHelper(message);
+  stopAutosaveTimer();
+  void saveTranscriptDraft();
+  void releaseWakeLock();
 }
 
 function closeSession() {
   window.clearTimeout(stopTimer);
+  stopAutosaveTimer();
+  void releaseWakeLock();
 
   if (!session) {
     return;
@@ -707,7 +766,239 @@ function clearTranscript() {
   liveDeltas = new Map();
   sourceText = "";
   translatedText = "";
+  lastSavedAt = 0;
   renderTranscript();
+  void clearTranscriptDraft();
+}
+
+function startAutosaveTimer() {
+  stopAutosaveTimer();
+  void saveTranscriptDraft();
+  autosaveTimer = window.setInterval(() => {
+    void saveTranscriptDraft();
+  }, AUTOSAVE_INTERVAL_MS);
+}
+
+function stopAutosaveTimer() {
+  window.clearInterval(autosaveTimer);
+  autosaveTimer = undefined;
+}
+
+async function saveTranscriptDraft() {
+  const draft = createTranscriptDraft();
+
+  if (!hasDraftContent(draft)) {
+    updateSessionNote();
+    return;
+  }
+
+  try {
+    await writeDraft(draft);
+    lastSavedAt = draft.savedAt;
+  } catch {
+    try {
+      localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draft));
+      lastSavedAt = draft.savedAt;
+    } catch {
+      // Autosave is best-effort; recording should continue even if storage is unavailable.
+    }
+  }
+
+  updateSessionNote();
+}
+
+async function restoreTranscriptDraft() {
+  const draft = await readDraft();
+
+  if (!draft || !isAppMode(draft.mode) || !hasDraftContent(draft)) {
+    updateSessionNote();
+    return;
+  }
+
+  setMode(draft.mode, { clear: false });
+  finalLines = new Map(draft.finalLines.map((line) => [line.itemId, line]));
+  liveDeltas = new Map();
+
+  if (draft.liveText) {
+    liveDeltas.set(lineKey("restored-live", 0), draft.liveText);
+  }
+
+  sourceText = draft.sourceText;
+  translatedText = draft.translatedText;
+  lastSavedAt = draft.savedAt;
+  renderTranscript();
+  setHelper("Restored your saved transcript from this device.");
+  updateSessionNote();
+}
+
+async function clearTranscriptDraft() {
+  try {
+    await deleteDraft();
+  } catch {
+    // Local storage fallback is still cleared below.
+  }
+
+  try {
+    localStorage.removeItem(DRAFT_STORAGE_KEY);
+  } catch {
+    // Some private browsing modes can block localStorage.
+  }
+
+  updateSessionNote();
+}
+
+function createTranscriptDraft(): SavedTranscriptDraft {
+  return {
+    id: DRAFT_ID,
+    mode: appMode,
+    savedAt: Date.now(),
+    finalLines: [...finalLines.values()].sort((a, b) => a.completedAt - b.completedAt),
+    liveText: getLiveText(),
+    sourceText,
+    translatedText
+  };
+}
+
+function hasDraftContent(draft: SavedTranscriptDraft) {
+  return Boolean(draft.finalLines.length || draft.liveText.trim() || draft.sourceText.trim() || draft.translatedText.trim());
+}
+
+function getLiveText() {
+  return [...liveDeltas.values()].join(" ").trim();
+}
+
+function updateSessionNote() {
+  const messages: string[] = [];
+
+  if (wakeLockActive) {
+    messages.push("Screen awake while recording");
+  } else if (state === "recording") {
+    messages.push("Keep this screen open while recording");
+  }
+
+  if (lastSavedAt > 0) {
+    messages.push(`Autosaved ${formatSavedTime(lastSavedAt)}`);
+  }
+
+  sessionNote.textContent = messages.join(" · ");
+}
+
+function formatSavedTime(timestamp: number) {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(new Date(timestamp));
+}
+
+async function requestWakeLock() {
+  const wakeLockApi = (navigator as NavigatorWithWakeLock).wakeLock;
+
+  if (!wakeLockApi || wakeLock) {
+    updateSessionNote();
+    return;
+  }
+
+  try {
+    wakeLock = await wakeLockApi.request("screen");
+    wakeLockActive = true;
+    wakeLock.addEventListener("release", () => {
+      wakeLock = null;
+      wakeLockActive = false;
+      updateSessionNote();
+    });
+  } catch {
+    wakeLock = null;
+    wakeLockActive = false;
+  }
+
+  updateSessionNote();
+}
+
+async function releaseWakeLock() {
+  const currentWakeLock = wakeLock;
+  wakeLock = null;
+  wakeLockActive = false;
+
+  try {
+    await currentWakeLock?.release();
+  } catch {
+    // Wake locks can already be released by the browser.
+  }
+
+  updateSessionNote();
+}
+
+async function writeDraft(draft: SavedTranscriptDraft) {
+  const db = await openDraftDatabase();
+
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(DRAFT_STORE_NAME, "readwrite");
+    transaction.objectStore(DRAFT_STORE_NAME).put(draft);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+
+  db.close();
+}
+
+async function readDraft() {
+  try {
+    const db = await openDraftDatabase();
+    const draft = await new Promise<SavedTranscriptDraft | undefined>((resolve, reject) => {
+      const transaction = db.transaction(DRAFT_STORE_NAME, "readonly");
+      const request = transaction.objectStore(DRAFT_STORE_NAME).get(DRAFT_ID);
+      request.onsuccess = () => resolve(request.result as SavedTranscriptDraft | undefined);
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+
+    if (draft) {
+      return draft;
+    }
+  } catch {
+    // Fall through to localStorage fallback.
+  }
+
+  try {
+    const fallback = localStorage.getItem(DRAFT_STORAGE_KEY);
+    return fallback ? (JSON.parse(fallback) as SavedTranscriptDraft) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function deleteDraft() {
+  const db = await openDraftDatabase();
+
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(DRAFT_STORE_NAME, "readwrite");
+    transaction.objectStore(DRAFT_STORE_NAME).delete(DRAFT_ID);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+
+  db.close();
+}
+
+function openDraftDatabase() {
+  return new Promise<IDBDatabase>((resolve, reject) => {
+    if (!("indexedDB" in window)) {
+      reject(new Error("IndexedDB is unavailable."));
+      return;
+    }
+
+    const request = indexedDB.open(DRAFT_DB_NAME, 1);
+
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(DRAFT_STORE_NAME)) {
+        db.createObjectStore(DRAFT_STORE_NAME, { keyPath: "id" });
+      }
+    };
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
 }
 
 function setFullTextOpen(open: boolean) {
@@ -787,6 +1078,10 @@ function getTranscriptText() {
 
 function isTranslationMode(mode: AppMode): mode is TranslationMode {
   return mode === "en-ja" || mode === "ja-en";
+}
+
+function isAppMode(mode: string): mode is AppMode {
+  return mode === "transcript" || mode === "en-ja" || mode === "ja-en";
 }
 
 function getSourceLanguage(mode: TranslationMode) {

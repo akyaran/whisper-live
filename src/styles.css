@@ -197,6 +197,12 @@ h2 {
   line-height: 1.45;
 }
 
+.session-note {
+  min-height: 1.3em;
+  font-size: 0.86rem;
+  font-weight: 800;
+}
+
 .meter {
   display: flex;
   align-items: center;
