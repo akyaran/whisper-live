@@ -4,8 +4,9 @@ type AppState = "idle" | "requesting-mic" | "connecting" | "recording" | "stoppi
 type AppMode = "transcript" | "en-ja" | "ja-en";
 type TranslationMode = Exclude<AppMode, "transcript">;
 
-const APP_VERSION = "v0.7.4";
+const APP_VERSION = "v0.7.5";
 const AUTOSAVE_INTERVAL_MS = 60_000;
+const TRANSLATION_SOURCE_FALLBACK_MS = 8_000;
 const TRANSCRIPT_WATCHDOG_INTERVAL_MS = 1_000;
 const TRANSCRIPT_STALL_MS = 18_000;
 const TRANSCRIPT_AUDIO_RECENT_MS = 4_000;
@@ -34,10 +35,14 @@ type RealtimeEvent =
   | {
       type: "session.input_transcript.delta";
       delta?: string;
+      transcript?: string;
+      text?: string;
     }
   | {
       type: "session.output_transcript.delta";
       delta?: string;
+      transcript?: string;
+      text?: string;
     }
   | {
       type: "error";
@@ -69,6 +74,8 @@ interface SessionResources {
   pc: RTCPeerConnection;
   dc: RTCDataChannel;
   stream: MediaStream;
+  sourcePc?: RTCPeerConnection;
+  sourceDc?: RTCDataChannel;
 }
 
 interface AudioMonitor {
@@ -309,6 +316,7 @@ let sourceText = "";
 let translatedText = "";
 let stopTimer: number | undefined;
 let autosaveTimer: number | undefined;
+let translationSourceFallbackTimer: number | undefined;
 let transcriptWatchdogTimer: number | undefined;
 let wakeLock: WakeLockSentinel | null = null;
 let wakeLockActive = false;
@@ -320,6 +328,7 @@ let lastAudioActivityAt = 0;
 let lastTranscriptEventAt = 0;
 let lastTranscriptReconnectAt = 0;
 let reconnectingTranscript = false;
+let translationInputTranscriptSeen = false;
 
 recordButton.addEventListener("click", () => {
   if (state === "recording") {
@@ -403,6 +412,7 @@ async function startRecording() {
 
   try {
     closeSession();
+    translationInputTranscriptSeen = false;
 
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -450,6 +460,9 @@ async function startRecording() {
     });
 
     session = { mode: appMode, pc, dc, stream };
+    if (isTranslationMode(appMode)) {
+      startTranslationSourceFallbackTimer();
+    }
   } catch (error) {
     closeSession();
     showError(error instanceof Error ? error.message : "Could not start recording.");
@@ -549,6 +562,83 @@ async function createTranslationAnswer(sdp: string, mode: TranslationMode) {
   return answerSdp;
 }
 
+function startTranslationSourceFallbackTimer() {
+  stopTranslationSourceFallbackTimer();
+
+  if (!isTranslationMode(appMode)) {
+    return;
+  }
+
+  translationSourceFallbackTimer = window.setTimeout(() => {
+    void ensureTranslationSourceFallback();
+  }, TRANSLATION_SOURCE_FALLBACK_MS);
+}
+
+function stopTranslationSourceFallbackTimer() {
+  window.clearTimeout(translationSourceFallbackTimer);
+  translationSourceFallbackTimer = undefined;
+}
+
+async function ensureTranslationSourceFallback() {
+  if (
+    !session ||
+    !isTranslationMode(session.mode) ||
+    state !== "recording" ||
+    translationInputTranscriptSeen ||
+    session.sourceDc ||
+    session.sourcePc
+  ) {
+    return;
+  }
+
+  try {
+    setHelper("Adding source transcript fallback.");
+    const sourceSession = await createParallelSourceTranscriptSession(session.stream, getSourceLanguage(session.mode));
+    session.sourcePc = sourceSession.pc;
+    session.sourceDc = sourceSession.dc;
+    setHelper("Speak naturally. Source and translation text will stream below.");
+  } catch {
+    setHelper("Translation is running, but source transcript fallback could not start.");
+  }
+}
+
+async function createParallelSourceTranscriptSession(stream: MediaStream, language: "en" | "ja") {
+  const { pc, dc } = createPeerConnection(stream);
+
+  dc.addEventListener("message", (event) => {
+    handleRealtimeEvent(event.data, "source");
+  });
+
+  dc.addEventListener("error", () => {
+    showError("Source transcript data channel reported an error.");
+  });
+
+  dc.addEventListener("close", () => {
+    handleDataChannelClose("Source transcript");
+  });
+
+  pc.addEventListener("connectionstatechange", () => {
+    if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+      showError("Source transcript connection was interrupted.");
+    }
+  });
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  if (!offer.sdp) {
+    throw new Error("Browser did not create a source transcript SDP offer.");
+  }
+
+  const answerSdp = await createTranscriptAnswer(offer.sdp, language);
+  await pc.setRemoteDescription({
+    type: "answer",
+    sdp: answerSdp
+  });
+
+  return { pc, dc };
+}
+
 async function stopRecording() {
   if (!session) {
     setState("idle");
@@ -558,6 +648,7 @@ async function stopRecording() {
   setState("stopping");
   setHelper("Finalizing the last words.");
   stopAutosaveTimer();
+  stopTranslationSourceFallbackTimer();
   stopTranscriptWatchdog();
   void saveTranscriptDraft();
   void releaseWakeLock();
@@ -576,6 +667,10 @@ async function stopRecording() {
 
   commitTranscriptBuffer();
 
+  if (session.sourceDc?.readyState === "open") {
+    session.sourceDc.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+  }
+
   window.clearTimeout(stopTimer);
   stopTimer = window.setTimeout(() => {
     void saveTranscriptDraft();
@@ -586,7 +681,7 @@ async function stopRecording() {
   }, 1600);
 }
 
-function handleRealtimeEvent(payload: string) {
+function handleRealtimeEvent(payload: string, channel: "primary" | "source" = "primary") {
   let event: RealtimeEvent;
 
   try {
@@ -605,6 +700,15 @@ function handleRealtimeEvent(payload: string) {
     const key = lineKey(event.item_id, event.content_index);
     const delta = event.delta ?? "";
 
+    if (isTranslationMode(appMode)) {
+      if (channel === "source") {
+        sourceText += delta;
+        renderTranscript();
+      }
+
+      return;
+    }
+
     liveDeltas.set(key, `${liveDeltas.get(key) ?? ""}${delta}`);
     renderTranscript();
     return;
@@ -614,6 +718,10 @@ function handleRealtimeEvent(payload: string) {
     lastTranscriptEventAt = Date.now();
     const key = lineKey(event.item_id, event.content_index);
     const transcript = (event.transcript ?? liveDeltas.get(key) ?? "").trim();
+
+    if (isTranslationMode(appMode)) {
+      return;
+    }
 
     if (transcript) {
       finalLines.set(key, {
@@ -634,7 +742,9 @@ function handleRealtimeEvent(payload: string) {
       return;
     }
 
-    sourceText += event.delta ?? "";
+    translationInputTranscriptSeen = true;
+    stopTranslationSourceFallbackTimer();
+    sourceText += getRealtimeText(event);
     renderTranscript();
     return;
   }
@@ -645,7 +755,7 @@ function handleRealtimeEvent(payload: string) {
       return;
     }
 
-    translatedText += event.delta ?? "";
+    translatedText += getRealtimeText(event);
     renderTranscript();
   }
 }
@@ -669,13 +779,18 @@ function isTranscriptCompletedEvent(
 function isTranslationInputDeltaEvent(
   event: RealtimeEvent
 ): event is Extract<RealtimeEvent, { type: "session.input_transcript.delta" }> {
-  return event.type === "session.input_transcript.delta";
+  return event.type.includes("input_transcript") && event.type.includes("delta");
 }
 
 function isTranslationOutputDeltaEvent(
   event: RealtimeEvent
 ): event is Extract<RealtimeEvent, { type: "session.output_transcript.delta" }> {
-  return event.type === "session.output_transcript.delta";
+  return event.type.includes("output_transcript") && event.type.includes("delta");
+}
+
+function getRealtimeText(event: RealtimeEvent) {
+  const candidate = event as { delta?: string; transcript?: string; text?: string };
+  return candidate.delta ?? candidate.transcript ?? candidate.text ?? "";
 }
 
 function renderTranscript() {
@@ -763,6 +878,7 @@ function showError(message: string) {
   setState("error");
   setHelper(message);
   stopAutosaveTimer();
+  stopTranslationSourceFallbackTimer();
   stopTranscriptWatchdog();
   void saveTranscriptDraft();
   void releaseWakeLock();
@@ -795,6 +911,7 @@ function handleConnectionInterruption(label: string) {
 function closeSession() {
   window.clearTimeout(stopTimer);
   stopAutosaveTimer();
+  stopTranslationSourceFallbackTimer();
   stopTranscriptWatchdog();
   stopAudioMonitor();
   void releaseWakeLock();
@@ -812,6 +929,12 @@ function closeSession() {
   }
 
   session.pc.close();
+
+  if (session.sourceDc && session.sourceDc.readyState !== "closed") {
+    session.sourceDc.close();
+  }
+
+  session.sourcePc?.close();
   session = null;
 }
 
@@ -1206,6 +1329,10 @@ function updateSessionNote() {
     messages.push("Reconnecting transcript");
   }
 
+  if (session?.sourceDc && isTranslationMode(session.mode)) {
+    messages.push("Source fallback active");
+  }
+
   if (lastSavedAt > 0) {
     messages.push(`Autosaved ${formatSavedTime(lastSavedAt)}`);
   }
@@ -1539,6 +1666,10 @@ function isTranslationMode(mode: AppMode): mode is TranslationMode {
 
 function isAppMode(mode: string): mode is AppMode {
   return mode === "transcript" || mode === "en-ja" || mode === "ja-en";
+}
+
+function getSourceLanguage(mode: TranslationMode) {
+  return mode === "en-ja" ? "en" : "ja";
 }
 
 function getTargetLanguage(mode: TranslationMode) {

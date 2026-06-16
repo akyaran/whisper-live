@@ -54,7 +54,8 @@ Build first so `dist` exists, then open the local Wrangler URL.
 ## Notes
 
 - `Transcript` mode is English-only through `audio.input.transcription.language: "en"`.
-- Translation modes use a single `gpt-realtime-translate` session for both source transcript and translated text.
+- Translation modes use `gpt-realtime-translate` for translated text and its source transcript events when available.
+- If source transcript events are not emitted by the browser translation session, the app automatically starts a fallback `gpt-realtime-whisper` source transcript session.
 - Transcripts are kept only in the browser session. They are not stored server-side.
 - Autosaved transcripts are stored only on the current device and are cleared by the `Clear` button.
 - Transcript history is stored only on the current device and can be deleted item-by-item or all at once.
