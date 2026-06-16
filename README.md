@@ -1,13 +1,13 @@
 # Whisper Live
 
-Cloudflare Pages + Pages Functions + PWA for English realtime transcription with OpenAI `gpt-realtime-whisper`.
+Cloudflare Pages + Pages Functions + PWA for realtime transcription and translation with OpenAI `gpt-realtime-translate`.
 
 ## What It Does
 
 - Runs as a mobile-first PWA on iPhone and iPad Safari.
 - Uses WebRTC for low-latency microphone audio.
 - Sends the OpenAI API key only from Cloudflare Pages Functions.
-- Shows live transcript deltas and final transcript lines.
+- Shows live transcript and translation text.
 - Switches between English-only transcription, English-to-Japanese translation, and Japanese-to-English translation.
 - Keeps the live view to the latest few lines while retaining a full transcript panel.
 - Autosaves the current transcript on-device during recording.
@@ -53,12 +53,11 @@ Build first so `dist` exists, then open the local Wrangler URL.
 
 ## Notes
 
-- `Transcript` mode is English-only through `audio.input.transcription.language: "en"`.
-- Translation modes use `gpt-realtime-translate` for translated text and its source transcript events when available.
-- If source transcript events are not emitted by the browser translation session, the app automatically starts a fallback `gpt-realtime-whisper` source transcript session.
+- `Transcript` mode uses a `gpt-realtime-translate` session with English output, so Whisper is not used in the active browser flow.
+- Translation modes open two `gpt-realtime-translate` sessions: one for the translated text and one for the source-language transcript.
 - Transcripts are kept only in the browser session. They are not stored server-side.
 - Autosaved transcripts are stored only on the current device and are cleared by the `Clear` button.
 - Transcript history is stored only on the current device and can be deleted item-by-item or all at once.
 - Screen wake lock reduces accidental auto-lock during recording, but manual lock or browser backgrounding can still stop capture.
-- Transcript mode watches microphone activity and reconnects the Realtime session if audio resumes but transcript events stop arriving.
+- Transcript mode watches microphone activity and reconnects the Realtime translation session if audio resumes but transcript events stop arriving.
 - The initial transcription delay is `low`. If you want faster partials, try `minimal`; if you want steadier accuracy, try `medium`, `high`, or `xhigh` in `functions/api/session.ts`.
