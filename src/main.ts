@@ -5,8 +5,9 @@ type AppMode = "transcript" | "en-ja" | "ja-en";
 type TranslationMode = Exclude<AppMode, "transcript">;
 type RealtimeChannel = "primary" | "source";
 
-const APP_VERSION = "v0.7.2";
+const APP_VERSION = "v0.7.3";
 const AUTOSAVE_INTERVAL_MS = 60_000;
+const TRANSCRIPT_COMMIT_INTERVAL_MS = 30_000;
 const DRAFT_DB_NAME = "whisper-live-drafts";
 const DRAFT_STORE_NAME = "drafts";
 const HISTORY_STORE_NAME = "history";
@@ -154,7 +155,7 @@ app.innerHTML = `
         <p id="modeBadge" class="eyebrow">OpenAI Realtime Whisper</p>
         <div class="title-row">
           <h1>Whisper Live</h1>
-          <span id="versionBadge" class="version-badge">v0.7.2</span>
+          <span id="versionBadge" class="version-badge">v0.7.3</span>
         </div>
       </div>
       <span id="statusBadge" class="status-badge" data-state="idle">Ready</span>
@@ -299,6 +300,7 @@ let sourceText = "";
 let translatedText = "";
 let stopTimer: number | undefined;
 let autosaveTimer: number | undefined;
+let transcriptCommitTimer: number | undefined;
 let wakeLock: WakeLockSentinel | null = null;
 let wakeLockActive = false;
 let lastSavedAt = 0;
@@ -409,6 +411,7 @@ async function startRecording() {
           : "Speak naturally. Tap stop to finalize the current transcript."
       );
       startAutosaveTimer();
+      startTranscriptCommitTimer();
       void requestWakeLock();
     });
 
@@ -575,6 +578,7 @@ async function stopRecording() {
   setState("stopping");
   setHelper("Finalizing the last words.");
   stopAutosaveTimer();
+  stopTranscriptCommitTimer();
   void saveTranscriptDraft();
   void releaseWakeLock();
 
@@ -582,13 +586,15 @@ async function stopRecording() {
     track.stop();
   }
 
-  if (session.dc.readyState === "open") {
+  if (session.dc.readyState === "open" && isTranslationMode(session.mode)) {
     session.dc.send(
       JSON.stringify({
-        type: isTranslationMode(session.mode) ? "session.close" : "input_audio_buffer.commit"
+        type: "session.close"
       })
     );
   }
+
+  commitTranscriptBuffer();
 
   if (session.sourceDc?.readyState === "open") {
     session.sourceDc.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
@@ -786,6 +792,7 @@ function showError(message: string) {
   setState("error");
   setHelper(message);
   stopAutosaveTimer();
+  stopTranscriptCommitTimer();
   void saveTranscriptDraft();
   void releaseWakeLock();
 }
@@ -799,6 +806,7 @@ function handleDataChannelClose(label: string) {
 function closeSession() {
   window.clearTimeout(stopTimer);
   stopAutosaveTimer();
+  stopTranscriptCommitTimer();
   void releaseWakeLock();
 
   if (!session) {
@@ -844,6 +852,31 @@ function startAutosaveTimer() {
 function stopAutosaveTimer() {
   window.clearInterval(autosaveTimer);
   autosaveTimer = undefined;
+}
+
+function startTranscriptCommitTimer() {
+  stopTranscriptCommitTimer();
+
+  if (isTranslationMode(appMode)) {
+    return;
+  }
+
+  transcriptCommitTimer = window.setInterval(() => {
+    commitTranscriptBuffer();
+  }, TRANSCRIPT_COMMIT_INTERVAL_MS);
+}
+
+function stopTranscriptCommitTimer() {
+  window.clearInterval(transcriptCommitTimer);
+  transcriptCommitTimer = undefined;
+}
+
+function commitTranscriptBuffer() {
+  if (!session || isTranslationMode(session.mode) || session.dc.readyState !== "open") {
+    return;
+  }
+
+  session.dc.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
 }
 
 async function saveTranscriptDraft() {
