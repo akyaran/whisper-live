@@ -5,7 +5,7 @@ type AppMode = "transcript" | "en-ja" | "ja-en";
 type TranslationMode = Exclude<AppMode, "transcript">;
 type RealtimeChannel = "primary" | "source";
 
-const APP_VERSION = "v0.7.0";
+const APP_VERSION = "v0.7.1";
 const AUTOSAVE_INTERVAL_MS = 60_000;
 const DRAFT_DB_NAME = "whisper-live-drafts";
 const DRAFT_STORE_NAME = "drafts";
@@ -154,7 +154,7 @@ app.innerHTML = `
         <p id="modeBadge" class="eyebrow">OpenAI Realtime Whisper</p>
         <div class="title-row">
           <h1>Whisper Live</h1>
-          <span id="versionBadge" class="version-badge">v0.7.0</span>
+          <span id="versionBadge" class="version-badge">v0.7.1</span>
         </div>
       </div>
       <span id="statusBadge" class="status-badge" data-state="idle">Ready</span>
@@ -420,6 +420,10 @@ async function startRecording() {
       showError("Realtime data channel reported an error.");
     });
 
+    dc.addEventListener("close", () => {
+      handleDataChannelClose("Realtime");
+    });
+
     pc.addEventListener("connectionstatechange", () => {
       if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
         showError("Realtime connection was interrupted.");
@@ -534,6 +538,10 @@ async function createParallelSourceTranscriptSession(stream: MediaStream, langua
 
   dc.addEventListener("error", () => {
     showError("Source transcript data channel reported an error.");
+  });
+
+  dc.addEventListener("close", () => {
+    handleDataChannelClose("Source transcript");
   });
 
   pc.addEventListener("connectionstatechange", () => {
@@ -780,6 +788,12 @@ function showError(message: string) {
   stopAutosaveTimer();
   void saveTranscriptDraft();
   void releaseWakeLock();
+}
+
+function handleDataChannelClose(label: string) {
+  if (state === "recording" || state === "connecting" || state === "requesting-mic") {
+    showError(`${label} connection closed unexpectedly.`);
+  }
 }
 
 function closeSession() {
