@@ -5,7 +5,7 @@ type AppMode = "transcript" | "en-ja" | "ja-en";
 type TranslationMode = Exclude<AppMode, "transcript">;
 type RealtimeChannel = "primary" | "source";
 
-const APP_VERSION = "v0.7.1";
+const APP_VERSION = "v0.7.2";
 const AUTOSAVE_INTERVAL_MS = 60_000;
 const DRAFT_DB_NAME = "whisper-live-drafts";
 const DRAFT_STORE_NAME = "drafts";
@@ -154,7 +154,7 @@ app.innerHTML = `
         <p id="modeBadge" class="eyebrow">OpenAI Realtime Whisper</p>
         <div class="title-row">
           <h1>Whisper Live</h1>
-          <span id="versionBadge" class="version-badge">v0.7.1</span>
+          <span id="versionBadge" class="version-badge">v0.7.2</span>
         </div>
       </div>
       <span id="statusBadge" class="status-badge" data-state="idle">Ready</span>
