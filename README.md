@@ -11,6 +11,7 @@ Cloudflare Pages + Pages Functions + PWA for English realtime transcription with
 - Switches between English-only transcription, English-to-Japanese translation, and Japanese-to-English translation.
 - Keeps the live view to the latest few lines while retaining a full transcript panel.
 - Autosaves the current transcript on-device during recording.
+- Keeps saved transcript history on-device with per-item download and delete controls.
 - Requests screen wake lock while recording when the browser supports it.
 - Supports copy, clear, and `.txt` download.
 
@@ -56,5 +57,6 @@ Build first so `dist` exists, then open the local Wrangler URL.
 - Translation modes use `gpt-realtime-translate` for the target language and a parallel `gpt-realtime-whisper` session for the source text.
 - Transcripts are kept only in the browser session. They are not stored server-side.
 - Autosaved transcripts are stored only on the current device and are cleared by the `Clear` button.
+- Transcript history is stored only on the current device and can be deleted item-by-item or all at once.
 - Screen wake lock reduces accidental auto-lock during recording, but manual lock or browser backgrounding can still stop capture.
 - The initial transcription delay is `low`. If you want faster partials, try `minimal`; if you want steadier accuracy, try `medium`, `high`, or `xhigh` in `functions/api/session.ts`.

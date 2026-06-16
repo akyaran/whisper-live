@@ -5,12 +5,14 @@ type AppMode = "transcript" | "en-ja" | "ja-en";
 type TranslationMode = Exclude<AppMode, "transcript">;
 type RealtimeChannel = "primary" | "source";
 
-const APP_VERSION = "v0.6.0";
+const APP_VERSION = "v0.7.0";
 const AUTOSAVE_INTERVAL_MS = 60_000;
 const DRAFT_DB_NAME = "whisper-live-drafts";
 const DRAFT_STORE_NAME = "drafts";
+const HISTORY_STORE_NAME = "history";
 const DRAFT_ID = "current";
 const DRAFT_STORAGE_KEY = "whisper-live-current-draft";
+const HISTORY_STORAGE_KEY = "whisper-live-history";
 
 type RealtimeEvent =
   | {
@@ -75,6 +77,13 @@ interface SavedTranscriptDraft {
   liveText: string;
   sourceText: string;
   translatedText: string;
+}
+
+interface SavedTranscriptHistory {
+  id: string;
+  mode: AppMode;
+  savedAt: number;
+  text: string;
 }
 
 interface WakeLockSentinel extends EventTarget {
@@ -145,7 +154,7 @@ app.innerHTML = `
         <p id="modeBadge" class="eyebrow">OpenAI Realtime Whisper</p>
         <div class="title-row">
           <h1>Whisper Live</h1>
-          <span id="versionBadge" class="version-badge">v0.6.0</span>
+          <span id="versionBadge" class="version-badge">v0.7.0</span>
         </div>
       </div>
       <span id="statusBadge" class="status-badge" data-state="idle">Ready</span>
@@ -163,11 +172,11 @@ app.innerHTML = `
         </label>
         <label>
           <input type="radio" name="mode" value="en-ja" />
-          <span>EN → JA</span>
+          <span>EN to JA</span>
         </label>
         <label>
           <input type="radio" name="mode" value="ja-en" />
-          <span>JA → EN</span>
+          <span>JA to EN</span>
         </label>
       </div>
     </section>
@@ -201,6 +210,7 @@ app.innerHTML = `
           <button id="copyButton" type="button">Copy</button>
           <button id="downloadButton" type="button">Download</button>
           <button id="fullTextButton" type="button" aria-expanded="false">Full text</button>
+          <button id="historyButton" type="button" aria-expanded="false">History</button>
           <button id="clearButton" type="button">Clear</button>
         </div>
       </div>
@@ -229,6 +239,20 @@ app.innerHTML = `
         </div>
         <pre id="fullTextContent"></pre>
       </section>
+
+      <section id="historyPanel" class="history-panel" aria-label="Transcript history" hidden>
+        <div class="history-header">
+          <div>
+            <p class="eyebrow">History</p>
+            <h2>Saved transcripts</h2>
+          </div>
+          <div class="history-header-actions">
+            <button id="clearHistoryButton" type="button">Delete all</button>
+            <button id="closeHistoryButton" type="button">Close</button>
+          </div>
+        </div>
+        <div id="historyList" class="history-list"></div>
+      </section>
     </section>
   </main>
 `;
@@ -247,7 +271,10 @@ const emptyState = getElement<HTMLParagraphElement>("emptyState");
 const copyButton = getElement<HTMLButtonElement>("copyButton");
 const downloadButton = getElement<HTMLButtonElement>("downloadButton");
 const fullTextButton = getElement<HTMLButtonElement>("fullTextButton");
+const historyButton = getElement<HTMLButtonElement>("historyButton");
 const closeFullTextButton = getElement<HTMLButtonElement>("closeFullTextButton");
+const closeHistoryButton = getElement<HTMLButtonElement>("closeHistoryButton");
+const clearHistoryButton = getElement<HTMLButtonElement>("clearHistoryButton");
 const clearButton = getElement<HTMLButtonElement>("clearButton");
 const transcriptView = getElement<HTMLDivElement>("transcriptView");
 const translationView = getElement<HTMLDivElement>("translationView");
@@ -257,11 +284,14 @@ const sourceLine = getElement<HTMLDivElement>("sourceLine");
 const translationLine = getElement<HTMLDivElement>("translationLine");
 const fullTextPanel = getElement<HTMLElement>("fullTextPanel");
 const fullTextContent = getElement<HTMLPreElement>("fullTextContent");
+const historyPanel = getElement<HTMLElement>("historyPanel");
+const historyList = getElement<HTMLDivElement>("historyList");
 const modeInputs = [...document.querySelectorAll<HTMLInputElement>('input[name="mode"]')];
 
 let state: AppState = "idle";
 let appMode: AppMode = "transcript";
 let fullTextOpen = false;
+let historyOpen = false;
 let session: SessionResources | null = null;
 let finalLines = new Map<string, FinalLine>();
 let liveDeltas = new Map<string, string>();
@@ -272,6 +302,8 @@ let autosaveTimer: number | undefined;
 let wakeLock: WakeLockSentinel | null = null;
 let wakeLockActive = false;
 let lastSavedAt = 0;
+let activeHistorySaved = false;
+let historyItems: SavedTranscriptHistory[] = [];
 
 recordButton.addEventListener("click", () => {
   if (state === "recording") {
@@ -308,8 +340,20 @@ fullTextButton.addEventListener("click", () => {
   setFullTextOpen(!fullTextOpen);
 });
 
+historyButton.addEventListener("click", () => {
+  setHistoryOpen(!historyOpen);
+});
+
 closeFullTextButton.addEventListener("click", () => {
   setFullTextOpen(false);
+});
+
+closeHistoryButton.addEventListener("click", () => {
+  setHistoryOpen(false);
+});
+
+clearHistoryButton.addEventListener("click", () => {
+  void clearTranscriptHistory();
 });
 
 window.addEventListener("beforeunload", () => {
@@ -334,10 +378,12 @@ if ("serviceWorker" in navigator) {
 versionBadge.textContent = APP_VERSION;
 setMode("transcript", { clear: false });
 void restoreTranscriptDraft();
+void loadTranscriptHistory();
 
 async function startRecording() {
   setState("requesting-mic");
   setHelper("Allow microphone access when Safari asks.");
+  activeHistorySaved = false;
 
   try {
     closeSession();
@@ -542,6 +588,8 @@ async function stopRecording() {
 
   window.clearTimeout(stopTimer);
   stopTimer = window.setTimeout(() => {
+    void saveTranscriptDraft();
+    void saveCurrentTranscriptToHistory();
     closeSession();
     setState("idle");
     setHelper("Ready for another take.");
@@ -847,6 +895,136 @@ async function clearTranscriptDraft() {
   updateSessionNote();
 }
 
+async function saveCurrentTranscriptToHistory() {
+  if (activeHistorySaved) {
+    return;
+  }
+
+  const text = getTranscriptText();
+  if (!text) {
+    return;
+  }
+
+  const item: SavedTranscriptHistory = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    mode: appMode,
+    savedAt: Date.now(),
+    text
+  };
+
+  try {
+    await writeHistoryItem(item);
+  } catch {
+    const fallback = await readHistoryFallback();
+    writeHistoryFallback([item, ...fallback]);
+  }
+
+  activeHistorySaved = true;
+  historyItems = [item, ...historyItems].sort((a, b) => b.savedAt - a.savedAt);
+  renderHistory();
+  setHelper("Saved this transcript to history.");
+}
+
+async function loadTranscriptHistory() {
+  historyItems = (await readHistory()).sort((a, b) => b.savedAt - a.savedAt);
+  renderHistory();
+}
+
+async function clearTranscriptHistory() {
+  if (historyItems.length === 0) {
+    setHelper("History is already empty.");
+    return;
+  }
+
+  try {
+    await deleteAllHistoryItems();
+  } catch {
+    writeHistoryFallback([]);
+  }
+
+  historyItems = [];
+  renderHistory();
+  setHelper("History deleted.");
+}
+
+async function deleteHistoryItem(id: string) {
+  try {
+    await deleteStoredHistoryItem(id);
+  } catch {
+    writeHistoryFallback(historyItems.filter((item) => item.id !== id));
+  }
+
+  historyItems = historyItems.filter((item) => item.id !== id);
+  renderHistory();
+  setHelper("History item deleted.");
+}
+
+function renderHistory() {
+  historyButton.setAttribute("aria-expanded", String(historyOpen));
+  historyButton.textContent = historyOpen ? "Hide history" : `History${historyItems.length ? ` (${historyItems.length})` : ""}`;
+  clearHistoryButton.disabled = historyItems.length === 0;
+
+  if (historyItems.length === 0) {
+    historyList.replaceChildren(createHistoryEmptyState());
+    return;
+  }
+
+  historyList.replaceChildren(...historyItems.map(createHistoryItemElement));
+}
+
+function createHistoryEmptyState() {
+  const empty = document.createElement("p");
+  empty.className = "empty-state";
+  empty.textContent = "No saved history yet.";
+  return empty;
+}
+
+function createHistoryItemElement(item: SavedTranscriptHistory) {
+  const row = document.createElement("article");
+  row.className = "history-item";
+
+  const meta = document.createElement("div");
+  meta.className = "history-meta";
+
+  const title = document.createElement("strong");
+  title.textContent = `${getModeLabel(item.mode)} - ${formatHistoryDate(item.savedAt)}`;
+
+  const preview = document.createElement("p");
+  preview.textContent = item.text.replace(/\s+/g, " ").trim().slice(0, 180) || "(empty)";
+
+  meta.appendChild(title);
+  meta.appendChild(preview);
+
+  const actions = document.createElement("div");
+  actions.className = "history-item-actions";
+
+  const download = document.createElement("button");
+  download.type = "button";
+  download.textContent = "Download";
+  download.addEventListener("click", () => {
+    downloadText(item.text, createDownloadName(item.mode, item.savedAt));
+  });
+
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "Delete";
+  remove.addEventListener("click", () => {
+    void deleteHistoryItem(item.id);
+  });
+
+  actions.appendChild(download);
+  actions.appendChild(remove);
+  row.appendChild(meta);
+  row.appendChild(actions);
+  return row;
+}
+
+function setHistoryOpen(open: boolean) {
+  historyOpen = open;
+  historyPanel.hidden = !open;
+  renderHistory();
+}
+
 function createTranscriptDraft(): SavedTranscriptDraft {
   return {
     id: DRAFT_ID,
@@ -880,7 +1058,7 @@ function updateSessionNote() {
     messages.push(`Autosaved ${formatSavedTime(lastSavedAt)}`);
   }
 
-  sessionNote.textContent = messages.join(" · ");
+  sessionNote.textContent = messages.join(" - ");
 }
 
 function formatSavedTime(timestamp: number) {
@@ -980,6 +1158,85 @@ async function deleteDraft() {
   db.close();
 }
 
+async function writeHistoryItem(item: SavedTranscriptHistory) {
+  const db = await openDraftDatabase();
+
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(HISTORY_STORE_NAME, "readwrite");
+    transaction.objectStore(HISTORY_STORE_NAME).put(item);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+
+  db.close();
+}
+
+async function readHistory() {
+  try {
+    const db = await openDraftDatabase();
+    const items = await new Promise<SavedTranscriptHistory[]>((resolve, reject) => {
+      const transaction = db.transaction(HISTORY_STORE_NAME, "readonly");
+      const request = transaction.objectStore(HISTORY_STORE_NAME).getAll();
+      request.onsuccess = () => resolve((request.result as SavedTranscriptHistory[]).filter(isHistoryItem));
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+
+    if (items.length > 0) {
+      return items;
+    }
+  } catch {
+    // Fall through to localStorage fallback.
+  }
+
+  return readHistoryFallback();
+}
+
+async function deleteStoredHistoryItem(id: string) {
+  const db = await openDraftDatabase();
+
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(HISTORY_STORE_NAME, "readwrite");
+    transaction.objectStore(HISTORY_STORE_NAME).delete(id);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+
+  db.close();
+}
+
+async function deleteAllHistoryItems() {
+  const db = await openDraftDatabase();
+
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(HISTORY_STORE_NAME, "readwrite");
+    transaction.objectStore(HISTORY_STORE_NAME).clear();
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+
+  db.close();
+  writeHistoryFallback([]);
+}
+
+async function readHistoryFallback() {
+  try {
+    const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+    return Array.isArray(parsed) ? parsed.filter(isHistoryItem) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeHistoryFallback(items: SavedTranscriptHistory[]) {
+  try {
+    localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(items));
+  } catch {
+    // History persistence is best-effort when storage is blocked.
+  }
+}
+
 function openDraftDatabase() {
   return new Promise<IDBDatabase>((resolve, reject) => {
     if (!("indexedDB" in window)) {
@@ -987,12 +1244,16 @@ function openDraftDatabase() {
       return;
     }
 
-    const request = indexedDB.open(DRAFT_DB_NAME, 1);
+    const request = indexedDB.open(DRAFT_DB_NAME, 2);
 
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(DRAFT_STORE_NAME)) {
         db.createObjectStore(DRAFT_STORE_NAME, { keyPath: "id" });
+      }
+
+      if (!db.objectStoreNames.contains(HISTORY_STORE_NAME)) {
+        db.createObjectStore(HISTORY_STORE_NAME, { keyPath: "id" });
       }
     };
 
@@ -1044,12 +1305,15 @@ function downloadTranscript() {
     return;
   }
 
-  const blob = new Blob([transcript, "\n"], { type: "text/plain;charset=utf-8" });
+  downloadText(transcript, createDownloadName(appMode, Date.now()));
+}
+
+function downloadText(text: string, fileName: string) {
+  const blob = new Blob([text, "\n"], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
-  const suffix = isTranslationMode(appMode) ? appMode : "transcript";
   link.href = url;
-  link.download = `whisper-live-${suffix}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`;
+  link.download = fileName;
   link.click();
   URL.revokeObjectURL(url);
 }
@@ -1074,6 +1338,47 @@ function getTranscriptText() {
     .map((line) => line.text)
     .join("\n")
     .trim();
+}
+
+function createDownloadName(mode: AppMode, timestamp: number) {
+  const suffix = isTranslationMode(mode) ? mode : "transcript";
+  return `whisper-live-${suffix}-${new Date(timestamp).toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`;
+}
+
+function getModeLabel(mode: AppMode) {
+  if (mode === "en-ja") {
+    return "EN to JA";
+  }
+
+  if (mode === "ja-en") {
+    return "JA to EN";
+  }
+
+  return "Transcript";
+}
+
+function formatHistoryDate(timestamp: number) {
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(new Date(timestamp));
+}
+
+function isHistoryItem(item: unknown): item is SavedTranscriptHistory {
+  if (!item || typeof item !== "object") {
+    return false;
+  }
+
+  const candidate = item as Partial<SavedTranscriptHistory>;
+  return (
+    typeof candidate.id === "string" &&
+    typeof candidate.savedAt === "number" &&
+    typeof candidate.text === "string" &&
+    typeof candidate.mode === "string" &&
+    isAppMode(candidate.mode)
+  );
 }
 
 function isTranslationMode(mode: AppMode): mode is TranslationMode {
