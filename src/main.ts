@@ -7,9 +7,9 @@ type ChannelRole = "primary" | "source-fallback";
 type SourceTextPath = "primary-input" | "fallback-input" | "fallback-output";
 type TranscriptTextPath = "input" | "output";
 
-const APP_VERSION = "v0.8.2";
+const APP_VERSION = "v0.8.3";
 const AUTOSAVE_INTERVAL_MS = 60_000;
-const SOURCE_FALLBACK_DELAY_MS = 8_000;
+const SOURCE_FALLBACK_DELAY_MS = 1_000;
 const TRANSCRIPT_WATCHDOG_INTERVAL_MS = 1_000;
 const TRANSCRIPT_STALL_MS = 18_000;
 const TRANSCRIPT_AUDIO_RECENT_MS = 4_000;

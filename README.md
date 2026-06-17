@@ -55,7 +55,7 @@ Build first so `dist` exists, then open the local Wrangler URL.
 
 - `Transcript` mode uses a `gpt-realtime-translate` session with English output, so Whisper is not used in the active browser flow.
 - Translation modes use the primary `gpt-realtime-translate` session's input transcript for source text first.
-- If primary input transcript events do not arrive, the app starts a source-language `gpt-realtime-translate` fallback session.
+- If primary input transcript events do not arrive within about 1 second, the app starts a source-language `gpt-realtime-translate` fallback session.
 - Realtime events are scoped by session id and channel role so stale events from a previous mode cannot update the current view.
 - Transcripts are kept only in the browser session. They are not stored server-side.
 - Autosaved transcripts are stored only on the current device and are cleared by the `Clear` button.
