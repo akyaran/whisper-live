@@ -3,9 +3,13 @@ import "./styles.css";
 type AppState = "idle" | "requesting-mic" | "connecting" | "recording" | "stopping" | "error";
 type AppMode = "transcript" | "en-ja" | "ja-en";
 type TranslationMode = Exclude<AppMode, "transcript">;
+type ChannelRole = "primary" | "source-fallback";
+type SourceTextPath = "primary-input" | "fallback-input" | "fallback-output";
+type TranscriptTextPath = "input" | "output";
 
-const APP_VERSION = "v0.8.1";
+const APP_VERSION = "v0.8.2";
 const AUTOSAVE_INTERVAL_MS = 60_000;
+const SOURCE_FALLBACK_DELAY_MS = 8_000;
 const TRANSCRIPT_WATCHDOG_INTERVAL_MS = 1_000;
 const TRANSCRIPT_STALL_MS = 18_000;
 const TRANSCRIPT_AUDIO_RECENT_MS = 4_000;
@@ -69,6 +73,7 @@ interface TranslationSecretResponse {
 }
 
 interface SessionResources {
+  id: number;
   mode: AppMode;
   pc: RTCPeerConnection;
   dc: RTCDataChannel;
@@ -313,10 +318,11 @@ let finalLines = new Map<string, FinalLine>();
 let liveDeltas = new Map<string, string>();
 let sourceText = "";
 let translatedText = "";
-let sourceTextEventSource: "input" | "output" | null = null;
-let transcriptTextEventSource: "input" | "output" | null = null;
+let sourceTextPath: SourceTextPath | null = null;
+let transcriptTextPath: TranscriptTextPath | null = null;
 let stopTimer: number | undefined;
 let autosaveTimer: number | undefined;
+let sourceFallbackTimer: number | undefined;
 let transcriptWatchdogTimer: number | undefined;
 let wakeLock: WakeLockSentinel | null = null;
 let wakeLockActive = false;
@@ -324,10 +330,12 @@ let lastSavedAt = 0;
 let activeHistorySaved = false;
 let historyItems: SavedTranscriptHistory[] = [];
 let audioMonitor: AudioMonitor | null = null;
+let nextSessionId = 1;
 let lastAudioActivityAt = 0;
 let lastTranscriptEventAt = 0;
 let lastTranscriptReconnectAt = 0;
 let reconnectingTranscript = false;
+let reconnectingSourceFallback = false;
 
 recordButton.addEventListener("click", () => {
   if (state === "recording") {
@@ -411,6 +419,8 @@ async function startRecording() {
 
   try {
     closeSession();
+    const recordingMode = appMode;
+    const sessionId = nextSessionId++;
 
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -426,10 +436,10 @@ async function startRecording() {
 
     const { pc, dc } = createPeerConnection(stream);
 
-    attachPrimaryRealtimeListeners(pc, dc, () => {
+    attachRealtimeListeners(pc, dc, { sessionId, mode: recordingMode, role: "primary" }, () => {
       setState("recording");
       setHelper(
-        isTranslationMode(appMode)
+        isTranslationMode(recordingMode)
           ? "Speak naturally. Source and translation text will stream below."
           : "Speak naturally. Tap stop to finalize the current transcript."
       );
@@ -437,6 +447,7 @@ async function startRecording() {
       lastTranscriptReconnectAt = 0;
       startAutosaveTimer();
       startTranscriptWatchdog();
+      startSourceFallbackTimer();
       void requestWakeLock();
     });
 
@@ -448,45 +459,49 @@ async function startRecording() {
       throw new Error("Browser did not create an SDP offer.");
     }
 
-    const answerSdp = await createTranslationAnswer(sdp, getPrimaryTranslationLanguage(appMode));
+    const answerSdp = await createTranslationAnswer(sdp, getPrimaryTranslationLanguage(recordingMode));
+
+    session = { id: sessionId, mode: recordingMode, pc, dc, stream };
 
     await pc.setRemoteDescription({
       type: "answer",
       sdp: answerSdp
     });
-
-    session = { mode: appMode, pc, dc, stream };
-    if (isTranslationMode(appMode)) {
-      const sourceSession = await createParallelSourceTranslationSession(stream, getSourceLanguage(appMode));
-      session.sourcePc = sourceSession.pc;
-      session.sourceDc = sourceSession.dc;
-    }
   } catch (error) {
     closeSession();
     showError(error instanceof Error ? error.message : "Could not start recording.");
   }
 }
 
-function attachPrimaryRealtimeListeners(pc: RTCPeerConnection, dc: RTCDataChannel, onOpen?: () => void) {
+function attachRealtimeListeners(
+  pc: RTCPeerConnection,
+  dc: RTCDataChannel,
+  context: { sessionId: number; mode: AppMode; role: ChannelRole },
+  onOpen?: () => void
+) {
   dc.addEventListener("open", () => {
     onOpen?.();
   });
 
   dc.addEventListener("message", (event) => {
-    handleRealtimeEvent(event.data);
+    handleRealtimeEvent(event.data, context);
   });
 
   dc.addEventListener("error", () => {
-    showError("Realtime data channel reported an error.");
+    if (!isCurrentSessionContext(context)) {
+      return;
+    }
+
+    showError(context.role === "primary" ? "Realtime data channel reported an error." : "Source fallback data channel reported an error.");
   });
 
   dc.addEventListener("close", () => {
-    handleDataChannelClose("Realtime");
+    handleDataChannelClose(context);
   });
 
   pc.addEventListener("connectionstatechange", () => {
     if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
-      handleConnectionInterruption("Realtime");
+      handleConnectionInterruption(context);
     }
   });
 }
@@ -543,41 +558,111 @@ async function createTranslationAnswer(sdp: string, targetLanguage: "en" | "ja")
   return answerSdp;
 }
 
-async function createParallelSourceTranslationSession(stream: MediaStream, language: "en" | "ja") {
-  const { pc, dc } = createPeerConnection(stream);
+async function createSourceFallbackSession(resources: SessionResources) {
+  if (!isTranslationMode(resources.mode)) {
+    return;
+  }
 
-  dc.addEventListener("message", (event) => {
-    handleRealtimeEvent(event.data, "source");
-  });
+  const { pc, dc } = createPeerConnection(resources.stream);
+  const context = { sessionId: resources.id, mode: resources.mode, role: "source-fallback" as const };
 
-  dc.addEventListener("error", () => {
-    showError("Source translation data channel reported an error.");
-  });
-
-  dc.addEventListener("close", () => {
-    handleDataChannelClose("Source translation");
-  });
-
-  pc.addEventListener("connectionstatechange", () => {
-    if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
-      showError("Source translation connection was interrupted.");
-    }
-  });
+  attachRealtimeListeners(pc, dc, context);
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
 
   if (!offer.sdp) {
-    throw new Error("Browser did not create a source translation SDP offer.");
+    throw new Error("Browser did not create a source fallback SDP offer.");
   }
 
-  const answerSdp = await createTranslationAnswer(offer.sdp, language);
+  const answerSdp = await createTranslationAnswer(offer.sdp, getSourceLanguage(resources.mode));
   await pc.setRemoteDescription({
     type: "answer",
     sdp: answerSdp
   });
 
-  return { pc, dc };
+  resources.sourcePc = pc;
+  resources.sourceDc = dc;
+  updateSessionNote();
+}
+
+async function reconnectSourceFallbackSession(reason: string) {
+  if (!session || !isTranslationMode(session.mode) || state !== "recording" || reconnectingSourceFallback) {
+    return;
+  }
+
+  const currentSession = session;
+  reconnectingSourceFallback = true;
+
+  try {
+    closeSourceFallbackConnection(currentSession);
+    setHelper(`Reconnecting source transcript: ${reason}.`);
+    await createSourceFallbackSession(currentSession);
+    setHelper("Speak naturally. Source and translation text will stream below.");
+  } catch {
+    setHelper("Translation is running, but source transcript reconnect failed.");
+  } finally {
+    reconnectingSourceFallback = false;
+    updateSessionNote();
+  }
+}
+
+function startSourceFallbackTimer() {
+  stopSourceFallbackTimer();
+
+  if (!session || !isTranslationMode(session.mode)) {
+    return;
+  }
+
+  sourceFallbackTimer = window.setTimeout(() => {
+    void ensureSourceFallbackSession();
+  }, SOURCE_FALLBACK_DELAY_MS);
+}
+
+function stopSourceFallbackTimer() {
+  window.clearTimeout(sourceFallbackTimer);
+  sourceFallbackTimer = undefined;
+}
+
+async function ensureSourceFallbackSession() {
+  if (!session || !isTranslationMode(session.mode) || state !== "recording" || sourceTextPath === "primary-input") {
+    return;
+  }
+
+  if (session.sourcePc || session.sourceDc) {
+    return;
+  }
+
+  try {
+    setHelper("Adding source transcript fallback.");
+    await createSourceFallbackSession(session);
+    setHelper("Speak naturally. Source and translation text will stream below.");
+  } catch {
+    setHelper("Translation is running, but source transcript fallback could not start.");
+  }
+}
+
+function closeSourceFallbackConnection(resources: SessionResources) {
+  if (resources.sourceDc && resources.sourceDc.readyState !== "closed") {
+    resources.sourceDc.close();
+  }
+
+  resources.sourcePc?.close();
+  resources.sourceDc = undefined;
+  resources.sourcePc = undefined;
+}
+
+function closeSourceFallbackConnectionIfIdle() {
+  if (!session || sourceTextPath !== "primary-input") {
+    return;
+  }
+
+  closeSourceFallbackConnection(session);
+  updateSessionNote();
+}
+
+function isCurrentSessionContext(context: { sessionId: number; mode: AppMode }) {
+  return Boolean(session && session.id === context.sessionId && session.mode === context.mode);
 }
 
 async function stopRecording() {
@@ -589,6 +674,7 @@ async function stopRecording() {
   setState("stopping");
   setHelper("Finalizing the last words.");
   stopAutosaveTimer();
+  stopSourceFallbackTimer();
   stopTranscriptWatchdog();
   void saveTranscriptDraft();
   void releaseWakeLock();
@@ -610,12 +696,19 @@ async function stopRecording() {
   }, 1600);
 }
 
-function handleRealtimeEvent(payload: string, channel: "primary" | "source" = "primary") {
+function handleRealtimeEvent(
+  payload: string,
+  context: { sessionId: number; mode: AppMode; role: ChannelRole }
+) {
   let event: RealtimeEvent;
 
   try {
     event = JSON.parse(payload) as RealtimeEvent;
   } catch {
+    return;
+  }
+
+  if (!isCurrentSessionContext(context)) {
     return;
   }
 
@@ -629,9 +722,9 @@ function handleRealtimeEvent(payload: string, channel: "primary" | "source" = "p
     const key = lineKey(event.item_id, event.content_index);
     const delta = event.delta ?? "";
 
-    if (isTranslationMode(appMode)) {
-      if (channel === "source") {
-        sourceText += delta;
+    if (isTranslationMode(context.mode)) {
+      if (context.role === "source-fallback") {
+        appendSourceText(delta, "fallback-output");
         renderTranscript();
       }
 
@@ -648,7 +741,7 @@ function handleRealtimeEvent(payload: string, channel: "primary" | "source" = "p
     const key = lineKey(event.item_id, event.content_index);
     const transcript = (event.transcript ?? liveDeltas.get(key) ?? "").trim();
 
-    if (isTranslationMode(appMode)) {
+    if (isTranslationMode(context.mode)) {
       return;
     }
 
@@ -669,14 +762,22 @@ function handleRealtimeEvent(payload: string, channel: "primary" | "source" = "p
     lastTranscriptEventAt = Date.now();
     const text = getRealtimeText(event);
 
-    if (appMode === "transcript") {
+    if (context.mode === "transcript") {
       appendTranscriptText(text, "input");
       renderTranscript();
       return;
     }
 
-    if (channel === "source" && isTranslationMode(appMode)) {
-      appendSourceText(text, "input");
+    if (context.role === "primary" && isTranslationMode(context.mode)) {
+      appendSourceText(text, "primary-input");
+      stopSourceFallbackTimer();
+      closeSourceFallbackConnectionIfIdle();
+      renderTranscript();
+      return;
+    }
+
+    if (context.role === "source-fallback" && isTranslationMode(context.mode)) {
+      appendSourceText(text, "fallback-input");
       renderTranscript();
     }
 
@@ -687,19 +788,19 @@ function handleRealtimeEvent(payload: string, channel: "primary" | "source" = "p
     lastTranscriptEventAt = Date.now();
     const text = getRealtimeText(event);
 
-    if (appMode === "transcript") {
+    if (context.mode === "transcript") {
       appendTranscriptText(text, "output");
       renderTranscript();
       return;
     }
 
-    if (channel === "source") {
-      appendSourceText(text, "output");
+    if (context.role === "source-fallback") {
+      appendSourceText(text, "fallback-output");
       renderTranscript();
       return;
     }
 
-    if (!isTranslationMode(appMode)) {
+    if (!isTranslationMode(context.mode)) {
       return;
     }
 
@@ -741,40 +842,42 @@ function getRealtimeText(event: RealtimeEvent) {
   return candidate.delta ?? candidate.transcript ?? candidate.text ?? "";
 }
 
-function appendTranscriptText(text: string, eventSource: "input" | "output") {
+function appendTranscriptText(text: string, path: TranscriptTextPath) {
   if (!text) {
     return;
   }
 
   const key = "translate-transcript";
 
-  if (transcriptTextEventSource && transcriptTextEventSource !== eventSource) {
-    if (transcriptTextEventSource === "input") {
+  if (transcriptTextPath && transcriptTextPath !== path) {
+    if (transcriptTextPath === "input") {
       return;
     }
 
     liveDeltas.delete(key);
   }
 
-  transcriptTextEventSource = eventSource;
+  transcriptTextPath = path;
   liveDeltas.set(key, `${liveDeltas.get(key) ?? ""}${text}`);
+  updateSessionNote();
 }
 
-function appendSourceText(text: string, eventSource: "input" | "output") {
+function appendSourceText(text: string, path: SourceTextPath) {
   if (!text) {
     return;
   }
 
-  if (sourceTextEventSource && sourceTextEventSource !== eventSource) {
-    if (sourceTextEventSource === "input") {
+  if (sourceTextPath && sourceTextPath !== path) {
+    if (sourceTextPath === "primary-input" || (sourceTextPath === "fallback-input" && path === "fallback-output")) {
       return;
     }
 
     sourceText = "";
   }
 
-  sourceTextEventSource = eventSource;
+  sourceTextPath = path;
   sourceText += text;
+  updateSessionNote();
 }
 
 function closeTranslationDataChannel(dc: RTCDataChannel | undefined) {
@@ -874,38 +977,62 @@ function showError(message: string) {
   setState("error");
   setHelper(message);
   stopAutosaveTimer();
+  stopSourceFallbackTimer();
   stopTranscriptWatchdog();
   void saveTranscriptDraft();
   void releaseWakeLock();
 }
 
-function handleDataChannelClose(label: string) {
-  if (reconnectingTranscript) {
+function handleDataChannelClose(context: { sessionId: number; mode: AppMode; role: ChannelRole }) {
+  if (!isCurrentSessionContext(context) || reconnectingTranscript || reconnectingSourceFallback) {
     return;
   }
 
   if (state === "recording" || state === "connecting" || state === "requesting-mic") {
-    if (session?.mode === "transcript" && state === "recording") {
-      void reconnectTranscriptSession(`${label} channel closed`);
+    if (context.role === "source-fallback") {
+      if (sourceTextPath === "primary-input") {
+        return;
+      }
+
+      void reconnectSourceFallbackSession("source fallback channel closed");
       return;
     }
 
-    showError(`${label} connection closed unexpectedly.`);
+    if (context.mode === "transcript" && state === "recording") {
+      void reconnectTranscriptSession("Realtime channel closed");
+      return;
+    }
+
+    showError("Realtime connection closed unexpectedly.");
   }
 }
 
-function handleConnectionInterruption(label: string) {
-  if (session?.mode === "transcript" && state === "recording") {
-    void reconnectTranscriptSession(`${label} connection interrupted`);
+function handleConnectionInterruption(context: { sessionId: number; mode: AppMode; role: ChannelRole }) {
+  if (!isCurrentSessionContext(context) || reconnectingSourceFallback) {
     return;
   }
 
-  showError(`${label} connection was interrupted.`);
+  if (context.role === "source-fallback" && state === "recording") {
+    if (sourceTextPath === "primary-input") {
+      return;
+    }
+
+    void reconnectSourceFallbackSession("source fallback connection interrupted");
+    return;
+  }
+
+  if (context.mode === "transcript" && state === "recording") {
+    void reconnectTranscriptSession("Realtime connection interrupted");
+    return;
+  }
+
+  showError("Realtime connection was interrupted.");
 }
 
 function closeSession() {
   window.clearTimeout(stopTimer);
   stopAutosaveTimer();
+  stopSourceFallbackTimer();
   stopTranscriptWatchdog();
   stopAudioMonitor();
   void releaseWakeLock();
@@ -937,8 +1064,8 @@ function clearTranscript() {
   liveDeltas = new Map();
   sourceText = "";
   translatedText = "";
-  sourceTextEventSource = null;
-  transcriptTextEventSource = null;
+  sourceTextPath = null;
+  transcriptTextPath = null;
   lastSavedAt = 0;
   renderTranscript();
   void clearTranscriptDraft();
@@ -1055,10 +1182,15 @@ async function reconnectTranscriptSession(reason: string) {
     closePrimaryConnection(currentSession);
 
     const { pc, dc } = createPeerConnection(currentSession.stream);
-    attachPrimaryRealtimeListeners(pc, dc, () => {
-      setHelper("Transcript reconnected. Keep speaking.");
-      lastTranscriptEventAt = Date.now();
-    });
+    attachRealtimeListeners(
+      pc,
+      dc,
+      { sessionId: currentSession.id, mode: currentSession.mode, role: "primary" },
+      () => {
+        setHelper("Transcript reconnected. Keep speaking.");
+        lastTranscriptEventAt = Date.now();
+      }
+    );
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -1132,8 +1264,8 @@ async function restoreTranscriptDraft() {
 
   sourceText = draft.sourceText;
   translatedText = draft.translatedText;
-  sourceTextEventSource = null;
-  transcriptTextEventSource = draft.liveText ? "output" : null;
+  sourceTextPath = null;
+  transcriptTextPath = draft.liveText ? "output" : null;
   lastSavedAt = draft.savedAt;
   renderTranscript();
   setHelper("Restored your saved transcript from this device.");
@@ -1319,8 +1451,9 @@ function updateSessionNote() {
     messages.push("Reconnecting transcript");
   }
 
-  if (session?.sourceDc && isTranslationMode(session.mode)) {
-    messages.push("Source translate active");
+  const sourceLabel = getSourceDiagnosticLabel();
+  if (sourceLabel) {
+    messages.push(sourceLabel);
   }
 
   if (lastSavedAt > 0) {
@@ -1328,6 +1461,32 @@ function updateSessionNote() {
   }
 
   sessionNote.textContent = messages.join(" - ");
+}
+
+function getSourceDiagnosticLabel() {
+  if (appMode === "transcript" && transcriptTextPath) {
+    return `Source: ${transcriptTextPath}`;
+  }
+
+  if (isTranslationMode(appMode)) {
+    if (sourceTextPath === "primary-input") {
+      return "Source: primary input";
+    }
+
+    if (sourceTextPath === "fallback-input") {
+      return "Source: fallback input";
+    }
+
+    if (sourceTextPath === "fallback-output") {
+      return "Source: fallback output";
+    }
+
+    if (session?.sourceDc) {
+      return "Source: fallback";
+    }
+  }
+
+  return "";
 }
 
 function formatSavedTime(timestamp: number) {
