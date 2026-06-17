@@ -3,13 +3,15 @@ import "./styles.css";
 type AppState = "idle" | "requesting-mic" | "connecting" | "recording" | "stopping" | "error";
 type AppMode = "transcript" | "en-ja" | "ja-en";
 type TranslationMode = Exclude<AppMode, "transcript">;
-type ChannelRole = "primary" | "source-fallback";
-type SourceTextPath = "primary-input" | "fallback-input" | "fallback-output";
+type ChannelRole = "primary" | "source-whisper";
+type SourceTextPath = "whisper" | "translate-backup";
 type TranscriptTextPath = "input" | "output";
 
-const APP_VERSION = "v0.8.3";
+const APP_VERSION = "v0.8.4";
 const AUTOSAVE_INTERVAL_MS = 60_000;
-const SOURCE_FALLBACK_DELAY_MS = 1_000;
+const SOURCE_WHISPER_COMMIT_INTERVAL_MS = 3_000;
+const SOURCE_WHISPER_STALL_MS = 12_000;
+const SOURCE_WHISPER_RECONNECT_COOLDOWN_MS = 10_000;
 const TRANSCRIPT_WATCHDOG_INTERVAL_MS = 1_000;
 const TRANSCRIPT_STALL_MS = 18_000;
 const TRANSCRIPT_AUDIO_RECENT_MS = 4_000;
@@ -322,7 +324,7 @@ let sourceTextPath: SourceTextPath | null = null;
 let transcriptTextPath: TranscriptTextPath | null = null;
 let stopTimer: number | undefined;
 let autosaveTimer: number | undefined;
-let sourceFallbackTimer: number | undefined;
+let sourceWhisperCommitTimer: number | undefined;
 let transcriptWatchdogTimer: number | undefined;
 let wakeLock: WakeLockSentinel | null = null;
 let wakeLockActive = false;
@@ -334,8 +336,10 @@ let nextSessionId = 1;
 let lastAudioActivityAt = 0;
 let lastTranscriptEventAt = 0;
 let lastTranscriptReconnectAt = 0;
+let lastSourceTranscriptAt = 0;
+let lastSourceReconnectAt = 0;
 let reconnectingTranscript = false;
-let reconnectingSourceFallback = false;
+let reconnectingSourceWhisper = false;
 
 recordButton.addEventListener("click", () => {
   if (state === "recording") {
@@ -445,9 +449,10 @@ async function startRecording() {
       );
       lastTranscriptEventAt = Date.now();
       lastTranscriptReconnectAt = 0;
+      lastSourceTranscriptAt = Date.now();
+      lastSourceReconnectAt = 0;
       startAutosaveTimer();
       startTranscriptWatchdog();
-      startSourceFallbackTimer();
       void requestWakeLock();
     });
 
@@ -467,6 +472,10 @@ async function startRecording() {
       type: "answer",
       sdp: answerSdp
     });
+
+    if (isTranslationMode(recordingMode)) {
+      await createSourceWhisperSession(session);
+    }
   } catch (error) {
     closeSession();
     showError(error instanceof Error ? error.message : "Could not start recording.");
@@ -492,7 +501,12 @@ function attachRealtimeListeners(
       return;
     }
 
-    showError(context.role === "primary" ? "Realtime data channel reported an error." : "Source fallback data channel reported an error.");
+    if (context.role === "source-whisper") {
+      void reconnectSourceWhisperSession("source Whisper data channel error");
+      return;
+    }
+
+    showError("Realtime data channel reported an error.");
   });
 
   dc.addEventListener("close", () => {
@@ -558,13 +572,30 @@ async function createTranslationAnswer(sdp: string, targetLanguage: "en" | "ja")
   return answerSdp;
 }
 
-async function createSourceFallbackSession(resources: SessionResources) {
+async function createTranscriptAnswer(sdp: string, language: "en" | "ja") {
+  const response = await fetch(`/api/session?mode=transcript&language=${language}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/sdp"
+    },
+    body: sdp
+  });
+
+  const answerSdp = await response.text();
+  if (!response.ok) {
+    throw new Error(readApiError(answerSdp));
+  }
+
+  return answerSdp;
+}
+
+async function createSourceWhisperSession(resources: SessionResources) {
   if (!isTranslationMode(resources.mode)) {
     return;
   }
 
   const { pc, dc } = createPeerConnection(resources.stream);
-  const context = { sessionId: resources.id, mode: resources.mode, role: "source-fallback" as const };
+  const context = { sessionId: resources.id, mode: resources.mode, role: "source-whisper" as const };
 
   attachRealtimeListeners(pc, dc, context);
 
@@ -572,10 +603,10 @@ async function createSourceFallbackSession(resources: SessionResources) {
   await pc.setLocalDescription(offer);
 
   if (!offer.sdp) {
-    throw new Error("Browser did not create a source fallback SDP offer.");
+    throw new Error("Browser did not create a source Whisper SDP offer.");
   }
 
-  const answerSdp = await createTranslationAnswer(offer.sdp, getSourceLanguage(resources.mode));
+  const answerSdp = await createTranscriptAnswer(offer.sdp, getSourceLanguage(resources.mode));
   await pc.setRemoteDescription({
     type: "answer",
     sdp: answerSdp
@@ -583,66 +614,41 @@ async function createSourceFallbackSession(resources: SessionResources) {
 
   resources.sourcePc = pc;
   resources.sourceDc = dc;
+  lastSourceTranscriptAt = Date.now();
+  startSourceWhisperCommitTimer();
   updateSessionNote();
 }
 
-async function reconnectSourceFallbackSession(reason: string) {
-  if (!session || !isTranslationMode(session.mode) || state !== "recording" || reconnectingSourceFallback) {
+async function reconnectSourceWhisperSession(reason: string) {
+  if (!session || !isTranslationMode(session.mode) || state !== "recording" || reconnectingSourceWhisper) {
     return;
   }
 
   const currentSession = session;
-  reconnectingSourceFallback = true;
+  const now = Date.now();
+  if (now - lastSourceReconnectAt < SOURCE_WHISPER_RECONNECT_COOLDOWN_MS) {
+    return;
+  }
+
+  reconnectingSourceWhisper = true;
+  lastSourceReconnectAt = now;
 
   try {
-    closeSourceFallbackConnection(currentSession);
+    closeSourceWhisperConnection(currentSession);
     setHelper(`Reconnecting source transcript: ${reason}.`);
-    await createSourceFallbackSession(currentSession);
+    await createSourceWhisperSession(currentSession);
     setHelper("Speak naturally. Source and translation text will stream below.");
   } catch {
-    setHelper("Translation is running, but source transcript reconnect failed.");
+    setHelper("Translation is running, but source Whisper reconnect failed.");
   } finally {
-    reconnectingSourceFallback = false;
+    reconnectingSourceWhisper = false;
     updateSessionNote();
   }
 }
 
-function startSourceFallbackTimer() {
-  stopSourceFallbackTimer();
+function closeSourceWhisperConnection(resources: SessionResources) {
+  stopSourceWhisperCommitTimer();
 
-  if (!session || !isTranslationMode(session.mode)) {
-    return;
-  }
-
-  sourceFallbackTimer = window.setTimeout(() => {
-    void ensureSourceFallbackSession();
-  }, SOURCE_FALLBACK_DELAY_MS);
-}
-
-function stopSourceFallbackTimer() {
-  window.clearTimeout(sourceFallbackTimer);
-  sourceFallbackTimer = undefined;
-}
-
-async function ensureSourceFallbackSession() {
-  if (!session || !isTranslationMode(session.mode) || state !== "recording" || sourceTextPath === "primary-input") {
-    return;
-  }
-
-  if (session.sourcePc || session.sourceDc) {
-    return;
-  }
-
-  try {
-    setHelper("Adding source transcript fallback.");
-    await createSourceFallbackSession(session);
-    setHelper("Speak naturally. Source and translation text will stream below.");
-  } catch {
-    setHelper("Translation is running, but source transcript fallback could not start.");
-  }
-}
-
-function closeSourceFallbackConnection(resources: SessionResources) {
   if (resources.sourceDc && resources.sourceDc.readyState !== "closed") {
     resources.sourceDc.close();
   }
@@ -652,17 +658,43 @@ function closeSourceFallbackConnection(resources: SessionResources) {
   resources.sourcePc = undefined;
 }
 
-function closeSourceFallbackConnectionIfIdle() {
-  if (!session || sourceTextPath !== "primary-input") {
+function isCurrentSessionContext(context: { sessionId: number; mode: AppMode }) {
+  return Boolean(session && session.id === context.sessionId && session.mode === context.mode);
+}
+
+function startSourceWhisperCommitTimer() {
+  stopSourceWhisperCommitTimer();
+  commitSourceWhisperBuffer();
+  sourceWhisperCommitTimer = window.setInterval(() => {
+    commitSourceWhisperBuffer();
+  }, SOURCE_WHISPER_COMMIT_INTERVAL_MS);
+}
+
+function stopSourceWhisperCommitTimer() {
+  window.clearInterval(sourceWhisperCommitTimer);
+  sourceWhisperCommitTimer = undefined;
+}
+
+function commitSourceWhisperBuffer() {
+  if (!session || !isTranslationMode(session.mode) || session.sourceDc?.readyState !== "open") {
     return;
   }
 
-  closeSourceFallbackConnection(session);
-  updateSessionNote();
+  session.sourceDc.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
 }
 
-function isCurrentSessionContext(context: { sessionId: number; mode: AppMode }) {
-  return Boolean(session && session.id === context.sessionId && session.mode === context.mode);
+function checkSourceWhisperHealth() {
+  if (!session || !isTranslationMode(session.mode) || state !== "recording" || reconnectingSourceWhisper) {
+    return;
+  }
+
+  const now = Date.now();
+  const audioIsActive = lastAudioActivityAt > 0 && now - lastAudioActivityAt <= TRANSCRIPT_AUDIO_RECENT_MS;
+  const sourceIsStale = lastSourceTranscriptAt > 0 && now - lastSourceTranscriptAt >= SOURCE_WHISPER_STALL_MS;
+
+  if (audioIsActive && sourceIsStale) {
+    void reconnectSourceWhisperSession("source Whisper stalled after audio resumed");
+  }
 }
 
 async function stopRecording() {
@@ -674,13 +706,13 @@ async function stopRecording() {
   setState("stopping");
   setHelper("Finalizing the last words.");
   stopAutosaveTimer();
-  stopSourceFallbackTimer();
+  stopSourceWhisperCommitTimer();
   stopTranscriptWatchdog();
   void saveTranscriptDraft();
   void releaseWakeLock();
 
   closeTranslationDataChannel(session.dc);
-  closeTranslationDataChannel(session.sourceDc);
+  commitSourceWhisperBuffer();
 
   for (const track of session.stream.getAudioTracks()) {
     track.stop();
@@ -713,6 +745,11 @@ function handleRealtimeEvent(
   }
 
   if (isErrorEvent(event)) {
+    if (context.role === "source-whisper") {
+      void reconnectSourceWhisperSession(event.error?.message ?? "source Whisper returned an error");
+      return;
+    }
+
     showError(event.error?.message ?? "Realtime API returned an error.");
     return;
   }
@@ -723,8 +760,9 @@ function handleRealtimeEvent(
     const delta = event.delta ?? "";
 
     if (isTranslationMode(context.mode)) {
-      if (context.role === "source-fallback") {
-        appendSourceText(delta, "fallback-output");
+      if (context.role === "source-whisper") {
+        lastSourceTranscriptAt = Date.now();
+        appendSourceText(delta, "whisper");
         renderTranscript();
       }
 
@@ -769,16 +807,9 @@ function handleRealtimeEvent(
     }
 
     if (context.role === "primary" && isTranslationMode(context.mode)) {
-      appendSourceText(text, "primary-input");
-      stopSourceFallbackTimer();
-      closeSourceFallbackConnectionIfIdle();
+      appendSourceText(text, "translate-backup");
       renderTranscript();
       return;
-    }
-
-    if (context.role === "source-fallback" && isTranslationMode(context.mode)) {
-      appendSourceText(text, "fallback-input");
-      renderTranscript();
     }
 
     return;
@@ -794,8 +825,8 @@ function handleRealtimeEvent(
       return;
     }
 
-    if (context.role === "source-fallback") {
-      appendSourceText(text, "fallback-output");
+    if (context.role === "primary" && isTranslationMode(context.mode)) {
+      appendSourceText(text, "translate-backup");
       renderTranscript();
       return;
     }
@@ -868,7 +899,7 @@ function appendSourceText(text: string, path: SourceTextPath) {
   }
 
   if (sourceTextPath && sourceTextPath !== path) {
-    if (sourceTextPath === "primary-input" || (sourceTextPath === "fallback-input" && path === "fallback-output")) {
+    if (sourceTextPath === "whisper") {
       return;
     }
 
@@ -977,24 +1008,20 @@ function showError(message: string) {
   setState("error");
   setHelper(message);
   stopAutosaveTimer();
-  stopSourceFallbackTimer();
+  stopSourceWhisperCommitTimer();
   stopTranscriptWatchdog();
   void saveTranscriptDraft();
   void releaseWakeLock();
 }
 
 function handleDataChannelClose(context: { sessionId: number; mode: AppMode; role: ChannelRole }) {
-  if (!isCurrentSessionContext(context) || reconnectingTranscript || reconnectingSourceFallback) {
+  if (!isCurrentSessionContext(context) || reconnectingTranscript || reconnectingSourceWhisper) {
     return;
   }
 
   if (state === "recording" || state === "connecting" || state === "requesting-mic") {
-    if (context.role === "source-fallback") {
-      if (sourceTextPath === "primary-input") {
-        return;
-      }
-
-      void reconnectSourceFallbackSession("source fallback channel closed");
+    if (context.role === "source-whisper") {
+      void reconnectSourceWhisperSession("source Whisper channel closed");
       return;
     }
 
@@ -1008,16 +1035,12 @@ function handleDataChannelClose(context: { sessionId: number; mode: AppMode; rol
 }
 
 function handleConnectionInterruption(context: { sessionId: number; mode: AppMode; role: ChannelRole }) {
-  if (!isCurrentSessionContext(context) || reconnectingSourceFallback) {
+  if (!isCurrentSessionContext(context) || reconnectingSourceWhisper) {
     return;
   }
 
-  if (context.role === "source-fallback" && state === "recording") {
-    if (sourceTextPath === "primary-input") {
-      return;
-    }
-
-    void reconnectSourceFallbackSession("source fallback connection interrupted");
+  if (context.role === "source-whisper" && state === "recording") {
+    void reconnectSourceWhisperSession("source Whisper connection interrupted");
     return;
   }
 
@@ -1032,7 +1055,7 @@ function handleConnectionInterruption(context: { sessionId: number; mode: AppMod
 function closeSession() {
   window.clearTimeout(stopTimer);
   stopAutosaveTimer();
-  stopSourceFallbackTimer();
+  stopSourceWhisperCommitTimer();
   stopTranscriptWatchdog();
   stopAudioMonitor();
   void releaseWakeLock();
@@ -1087,12 +1110,9 @@ function stopAutosaveTimer() {
 function startTranscriptWatchdog() {
   stopTranscriptWatchdog();
 
-  if (isTranslationMode(appMode)) {
-    return;
-  }
-
   transcriptWatchdogTimer = window.setInterval(() => {
     checkTranscriptHealth();
+    checkSourceWhisperHealth();
   }, TRANSCRIPT_WATCHDOG_INTERVAL_MS);
 }
 
@@ -1469,20 +1489,20 @@ function getSourceDiagnosticLabel() {
   }
 
   if (isTranslationMode(appMode)) {
-    if (sourceTextPath === "primary-input") {
-      return "Source: primary input";
+    if (reconnectingSourceWhisper) {
+      return "Source: reconnecting";
     }
 
-    if (sourceTextPath === "fallback-input") {
-      return "Source: fallback input";
+    if (sourceTextPath === "whisper") {
+      return "Source: whisper";
     }
 
-    if (sourceTextPath === "fallback-output") {
-      return "Source: fallback output";
+    if (sourceTextPath === "translate-backup") {
+      return "Source: translate backup";
     }
 
     if (session?.sourceDc) {
-      return "Source: fallback";
+      return "Source: whisper standby";
     }
   }
 

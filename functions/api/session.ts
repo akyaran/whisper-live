@@ -13,7 +13,7 @@ function createTranscriptSessionConfig(language: LanguageCode) {
         transcription: {
           model: "gpt-realtime-whisper",
           language,
-          delay: "low"
+          delay: "minimal"
         },
         turn_detection: null
       }

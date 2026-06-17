@@ -1,6 +1,6 @@
 # Whisper Live
 
-Cloudflare Pages + Pages Functions + PWA for realtime transcription and translation with OpenAI `gpt-realtime-translate`.
+Cloudflare Pages + Pages Functions + PWA for realtime transcription and translation with OpenAI Realtime models.
 
 ## What It Does
 
@@ -53,13 +53,13 @@ Build first so `dist` exists, then open the local Wrangler URL.
 
 ## Notes
 
-- `Transcript` mode uses a `gpt-realtime-translate` session with English output, so Whisper is not used in the active browser flow.
-- Translation modes use the primary `gpt-realtime-translate` session's input transcript for source text first.
-- If primary input transcript events do not arrive within about 1 second, the app starts a source-language `gpt-realtime-translate` fallback session.
+- `Transcript` mode uses a `gpt-realtime-translate` session with English output.
+- Translation modes use `gpt-realtime-translate` for translated text and `gpt-realtime-whisper` for the source-language transcript.
+- Translate transcript events are kept as a backup until the source Whisper transcript starts streaming.
 - Realtime events are scoped by session id and channel role so stale events from a previous mode cannot update the current view.
 - Transcripts are kept only in the browser session. They are not stored server-side.
 - Autosaved transcripts are stored only on the current device and are cleared by the `Clear` button.
 - Transcript history is stored only on the current device and can be deleted item-by-item or all at once.
 - Screen wake lock reduces accidental auto-lock during recording, but manual lock or browser backgrounding can still stop capture.
 - Transcript mode watches microphone activity and reconnects the Realtime translation session if audio resumes but transcript events stop arriving.
-- The initial transcription delay is `low`. If you want faster partials, try `minimal`; if you want steadier accuracy, try `medium`, `high`, or `xhigh` in `functions/api/session.ts`.
+- Source Whisper uses `minimal` transcription delay for faster partials.
