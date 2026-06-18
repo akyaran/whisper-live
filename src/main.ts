@@ -6,8 +6,10 @@ type TranslationMode = Exclude<AppMode, "transcript">;
 type ChannelRole = "primary" | "source-whisper";
 type SourceTextPath = "whisper" | "translate-backup";
 type TranscriptTextPath = "input" | "output";
+type ChannelStatus = "idle" | "connecting" | "open" | "closed" | "error";
+type PeerStatus = "new" | "connecting" | "connected" | "disconnected" | "failed" | "closed";
 
-const APP_VERSION = "v0.8.4";
+const APP_VERSION = "v0.8.5";
 const AUTOSAVE_INTERVAL_MS = 60_000;
 const SOURCE_WHISPER_COMMIT_INTERVAL_MS = 3_000;
 const SOURCE_WHISPER_STALL_MS = 12_000;
@@ -340,6 +342,15 @@ let lastSourceTranscriptAt = 0;
 let lastSourceReconnectAt = 0;
 let reconnectingTranscript = false;
 let reconnectingSourceWhisper = false;
+let primaryChannelStatus: ChannelStatus = "idle";
+let sourceChannelStatus: ChannelStatus = "idle";
+let primaryPeerStatus: PeerStatus = "new";
+let sourcePeerStatus: PeerStatus = "new";
+let lastPrimaryEventAt = 0;
+let lastSourceEventAt = 0;
+let transcriptReconnectCount = 0;
+let sourceReconnectCount = 0;
+let lastRealtimeError = "";
 
 recordButton.addEventListener("click", () => {
   if (state === "recording") {
@@ -425,6 +436,7 @@ async function startRecording() {
     closeSession();
     const recordingMode = appMode;
     const sessionId = nextSessionId++;
+    resetRealtimeDiagnostics(recordingMode);
 
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -488,11 +500,16 @@ function attachRealtimeListeners(
   context: { sessionId: number; mode: AppMode; role: ChannelRole },
   onOpen?: () => void
 ) {
+  setRealtimeChannelStatus(context.role, "connecting");
+  setRealtimePeerStatus(context.role, pc.connectionState);
+
   dc.addEventListener("open", () => {
+    setRealtimeChannelStatus(context.role, "open");
     onOpen?.();
   });
 
   dc.addEventListener("message", (event) => {
+    markRealtimeEvent(context.role);
     handleRealtimeEvent(event.data, context);
   });
 
@@ -500,6 +517,9 @@ function attachRealtimeListeners(
     if (!isCurrentSessionContext(context)) {
       return;
     }
+
+    setRealtimeChannelStatus(context.role, "error");
+    setLastRealtimeError(`${getRoleLabel(context.role)} data channel error`);
 
     if (context.role === "source-whisper") {
       void reconnectSourceWhisperSession("source Whisper data channel error");
@@ -510,10 +530,13 @@ function attachRealtimeListeners(
   });
 
   dc.addEventListener("close", () => {
+    setRealtimeChannelStatus(context.role, "closed");
     handleDataChannelClose(context);
   });
 
   pc.addEventListener("connectionstatechange", () => {
+    setRealtimePeerStatus(context.role, pc.connectionState);
+
     if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
       handleConnectionInterruption(context);
     }
@@ -631,7 +654,9 @@ async function reconnectSourceWhisperSession(reason: string) {
   }
 
   reconnectingSourceWhisper = true;
+  sourceReconnectCount += 1;
   lastSourceReconnectAt = now;
+  setLastRealtimeError(`Source reconnect: ${reason}`);
 
   try {
     closeSourceWhisperConnection(currentSession);
@@ -660,6 +685,60 @@ function closeSourceWhisperConnection(resources: SessionResources) {
 
 function isCurrentSessionContext(context: { sessionId: number; mode: AppMode }) {
   return Boolean(session && session.id === context.sessionId && session.mode === context.mode);
+}
+
+function resetRealtimeDiagnostics(mode: AppMode) {
+  primaryChannelStatus = "idle";
+  sourceChannelStatus = isTranslationMode(mode) ? "idle" : "closed";
+  primaryPeerStatus = "new";
+  sourcePeerStatus = "new";
+  lastPrimaryEventAt = 0;
+  lastSourceEventAt = 0;
+  transcriptReconnectCount = 0;
+  sourceReconnectCount = 0;
+  lastRealtimeError = "";
+  updateSessionNote();
+}
+
+function setRealtimeChannelStatus(role: ChannelRole, status: ChannelStatus) {
+  if (role === "primary") {
+    primaryChannelStatus = status;
+  } else {
+    sourceChannelStatus = status;
+  }
+
+  updateSessionNote();
+}
+
+function setRealtimePeerStatus(role: ChannelRole, status: RTCPeerConnectionState) {
+  if (role === "primary") {
+    primaryPeerStatus = status;
+  } else {
+    sourcePeerStatus = status;
+  }
+
+  updateSessionNote();
+}
+
+function markRealtimeEvent(role: ChannelRole) {
+  const now = Date.now();
+
+  if (role === "primary") {
+    lastPrimaryEventAt = now;
+  } else {
+    lastSourceEventAt = now;
+  }
+
+  updateSessionNote();
+}
+
+function setLastRealtimeError(message: string) {
+  lastRealtimeError = shortenDiagnosticText(message);
+  updateSessionNote();
+}
+
+function getRoleLabel(role: ChannelRole) {
+  return role === "primary" ? "Primary" : "Source";
 }
 
 function startSourceWhisperCommitTimer() {
@@ -745,6 +824,8 @@ function handleRealtimeEvent(
   }
 
   if (isErrorEvent(event)) {
+    setLastRealtimeError(event.error?.message ?? `${getRoleLabel(context.role)} returned an error`);
+
     if (context.role === "source-whisper") {
       void reconnectSourceWhisperSession(event.error?.message ?? "source Whisper returned an error");
       return;
@@ -825,13 +906,7 @@ function handleRealtimeEvent(
       return;
     }
 
-    if (context.role === "primary" && isTranslationMode(context.mode)) {
-      appendSourceText(text, "translate-backup");
-      renderTranscript();
-      return;
-    }
-
-    if (!isTranslationMode(context.mode)) {
+    if (context.role !== "primary" || !isTranslationMode(context.mode)) {
       return;
     }
 
@@ -1113,6 +1188,7 @@ function startTranscriptWatchdog() {
   transcriptWatchdogTimer = window.setInterval(() => {
     checkTranscriptHealth();
     checkSourceWhisperHealth();
+    updateSessionNote();
   }, TRANSCRIPT_WATCHDOG_INTERVAL_MS);
 }
 
@@ -1192,8 +1268,10 @@ async function reconnectTranscriptSession(reason: string) {
   }
 
   reconnectingTranscript = true;
+  transcriptReconnectCount += 1;
   lastTranscriptReconnectAt = now;
   lastTranscriptEventAt = now;
+  setLastRealtimeError(`Transcript reconnect: ${reason}`);
   setHelper(`Reconnecting transcript: ${reason}.`);
   updateSessionNote();
 
@@ -1476,6 +1554,11 @@ function updateSessionNote() {
     messages.push(sourceLabel);
   }
 
+  const realtimeLabel = getRealtimeDiagnosticLabel();
+  if (realtimeLabel) {
+    messages.push(realtimeLabel);
+  }
+
   if (lastSavedAt > 0) {
     messages.push(`Autosaved ${formatSavedTime(lastSavedAt)}`);
   }
@@ -1507,6 +1590,67 @@ function getSourceDiagnosticLabel() {
   }
 
   return "";
+}
+
+function getRealtimeDiagnosticLabel() {
+  if (state === "idle" && !session) {
+    return "";
+  }
+
+  if (!session && !lastRealtimeError) {
+    return "";
+  }
+
+  const parts = [`P ${primaryPeerStatus}/${primaryChannelStatus}`];
+
+  if (isTranslationMode(appMode) || sourceChannelStatus !== "closed") {
+    parts.push(`S ${sourcePeerStatus}/${sourceChannelStatus}`);
+  }
+
+  const eventParts: string[] = [];
+  const primaryAge = formatEventAge(lastPrimaryEventAt);
+  const sourceAge = formatEventAge(lastSourceEventAt);
+
+  if (primaryAge) {
+    eventParts.push(`P ${primaryAge}`);
+  }
+
+  if (sourceAge && (isTranslationMode(appMode) || sourceChannelStatus !== "closed")) {
+    eventParts.push(`S ${sourceAge}`);
+  }
+
+  if (eventParts.length > 0) {
+    parts.push(`events ${eventParts.join("/")}`);
+  }
+
+  if (transcriptReconnectCount > 0 || sourceReconnectCount > 0) {
+    parts.push(`reconnects T${transcriptReconnectCount}/S${sourceReconnectCount}`);
+  }
+
+  if (lastRealtimeError) {
+    parts.push(`last ${lastRealtimeError}`);
+  }
+
+  return `Diag: ${parts.join(" | ")}`;
+}
+
+function formatEventAge(timestamp: number) {
+  if (!timestamp) {
+    return "";
+  }
+
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+
+  if (elapsedSeconds < 60) {
+    return `${elapsedSeconds}s`;
+  }
+
+  return `${Math.floor(elapsedSeconds / 60)}m`;
+}
+
+function shortenDiagnosticText(text: string) {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  return normalized.length > 80 ? `${normalized.slice(0, 77)}...` : normalized;
 }
 
 function formatSavedTime(timestamp: number) {

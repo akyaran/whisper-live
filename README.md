@@ -13,6 +13,7 @@ Cloudflare Pages + Pages Functions + PWA for realtime transcription and translat
 - Autosaves the current transcript on-device during recording.
 - Keeps saved transcript history on-device with per-item download and delete controls.
 - Requests screen wake lock while recording when the browser supports it.
+- Shows compact realtime diagnostics for connection state, event age, reconnect counts, and the latest API/channel error.
 - Supports copy, clear, and `.txt` download.
 
 ## Local Setup
@@ -63,3 +64,4 @@ Build first so `dist` exists, then open the local Wrangler URL.
 - Screen wake lock reduces accidental auto-lock during recording, but manual lock or browser backgrounding can still stop capture.
 - Transcript mode watches microphone activity and reconnects the Realtime translation session if audio resumes but transcript events stop arriving.
 - Source Whisper uses `minimal` transcription delay for faster partials.
+- The `Diag` note is intentionally short: `P` is the primary translation/transcript session, and `S` is the source Whisper session used in translation modes.
