@@ -15,6 +15,7 @@ Cloudflare Pages + Pages Functions + PWA for realtime transcription and translat
 - Requests screen wake lock while recording when the browser supports it.
 - Shows compact realtime diagnostics for connection state, event age, reconnect counts, and the latest API/channel error.
 - Shows a clearer sign-in/network hint if the Cloudflare-protected session endpoint cannot be loaded.
+- Uses a network-first service worker for same-origin app files so deployed updates replace cached PWA assets faster.
 - Supports copy, clear, and `.txt` download.
 
 ## Local Setup
@@ -67,3 +68,4 @@ Build first so `dist` exists, then open the local Wrangler URL.
 - Source Whisper uses `minimal` transcription delay for faster partials.
 - The `Diag` note is intentionally short: `P` is the primary translation/transcript session, and `S` is the source Whisper session used in translation modes.
 - If Cloudflare Access expires while the PWA shell is cached, session creation can fail before recording starts; reload the page and sign in again.
+- The service worker checks for updates on load and activates a new version immediately when the browser allows it.

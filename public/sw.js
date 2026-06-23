@@ -1,5 +1,11 @@
-const CACHE_NAME = "whisper-live-v20";
+const CACHE_NAME = "whisper-live-v21";
 const APP_SHELL = ["/", "/manifest.webmanifest", "/icon.svg"];
+
+self.addEventListener("message", (event) => {
+  if (event.data?.type === "SKIP_WAITING") {
+    self.skipWaiting();
+  }
+});
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -24,21 +30,36 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  event.respondWith(
-    caches.match(request).then((cached) => {
-      if (cached) {
-        return cached;
-      }
+  const url = new URL(request.url);
 
-      return fetch(request)
-        .then((response) => {
-          if (response.ok && new URL(request.url).origin === self.location.origin) {
-            const clone = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
+  if (url.origin !== self.location.origin) {
+    return;
+  }
+
+  event.respondWith(
+    fetch(request)
+      .then((response) => {
+        if (response.ok) {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
+        }
+
+        return response;
+      })
+      .catch(async () => {
+        const cached = await caches.match(request);
+        if (cached) {
+          return cached;
+        }
+
+        if (request.mode === "navigate") {
+          const shell = await caches.match("/");
+          if (shell) {
+            return shell;
           }
-          return response;
-        })
-        .catch(() => caches.match("/"));
-    })
+        }
+
+        return Response.error();
+      })
   );
 });

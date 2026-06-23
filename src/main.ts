@@ -9,7 +9,7 @@ type TranscriptTextPath = "input" | "output";
 type ChannelStatus = "idle" | "connecting" | "open" | "closed" | "error";
 type PeerStatus = "new" | "connecting" | "connected" | "disconnected" | "failed" | "closed";
 
-const APP_VERSION = "v0.8.6";
+const APP_VERSION = "v0.8.7";
 const AUTOSAVE_INTERVAL_MS = 60_000;
 const SOURCE_WHISPER_COMMIT_INTERVAL_MS = 3_000;
 const SOURCE_WHISPER_STALL_MS = 12_000;
@@ -416,9 +416,7 @@ document.addEventListener("visibilitychange", () => {
 
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {
-    navigator.serviceWorker.register("/sw.js").catch(() => {
-      // The app still works online if service worker registration is unavailable.
-    });
+    void registerServiceWorker();
   });
 }
 
@@ -426,6 +424,38 @@ versionBadge.textContent = APP_VERSION;
 setMode("transcript", { clear: false });
 void restoreTranscriptDraft();
 void loadTranscriptHistory();
+
+async function registerServiceWorker() {
+  let refreshing = false;
+
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (refreshing) {
+      return;
+    }
+
+    refreshing = true;
+    window.location.reload();
+  });
+
+  try {
+    const registration = await navigator.serviceWorker.register(`/sw.js?v=${encodeURIComponent(APP_VERSION)}`, {
+      updateViaCache: "none"
+    });
+
+    registration.addEventListener("updatefound", () => {
+      const nextWorker = registration.installing;
+      nextWorker?.addEventListener("statechange", () => {
+        if (nextWorker.state === "installed" && navigator.serviceWorker.controller) {
+          nextWorker.postMessage({ type: "SKIP_WAITING" });
+        }
+      });
+    });
+
+    await registration.update();
+  } catch {
+    // The app still works online if service worker registration is unavailable.
+  }
+}
 
 async function startRecording() {
   setState("requesting-mic");
