@@ -9,7 +9,7 @@ type TranscriptTextPath = "input" | "output";
 type ChannelStatus = "idle" | "connecting" | "open" | "closed" | "error";
 type PeerStatus = "new" | "connecting" | "connected" | "disconnected" | "failed" | "closed";
 
-const APP_VERSION = "v0.8.5";
+const APP_VERSION = "v0.8.6";
 const AUTOSAVE_INTERVAL_MS = 60_000;
 const SOURCE_WHISPER_COMMIT_INTERVAL_MS = 3_000;
 const SOURCE_WHISPER_STALL_MS = 12_000;
@@ -555,7 +555,7 @@ function createPeerConnection(stream: MediaStream) {
 }
 
 async function createTranslationAnswer(sdp: string, targetLanguage: "en" | "ja") {
-  const sessionResponse = await fetch("/api/session?mode=translate", {
+  const sessionResponse = await fetchSessionEndpoint("/api/session?mode=translate", {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
@@ -565,7 +565,7 @@ async function createTranslationAnswer(sdp: string, targetLanguage: "en" | "ja")
 
   const sessionBody = await sessionResponse.text();
   if (!sessionResponse.ok) {
-    throw new Error(readApiError(sessionBody));
+    throw new Error(readApiError(sessionBody, sessionResponse));
   }
 
   const translationSession = JSON.parse(sessionBody) as TranslationSecretResponse;
@@ -578,7 +578,7 @@ async function createTranslationAnswer(sdp: string, targetLanguage: "en" | "ja")
     throw new Error("Translation session did not include a client secret.");
   }
 
-  const sdpResponse = await fetch(translationSession.endpoint, {
+  const sdpResponse = await fetchRealtimeEndpoint(translationSession.endpoint, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${clientSecret}`,
@@ -596,7 +596,7 @@ async function createTranslationAnswer(sdp: string, targetLanguage: "en" | "ja")
 }
 
 async function createTranscriptAnswer(sdp: string, language: "en" | "ja") {
-  const response = await fetch(`/api/session?mode=transcript&language=${language}`, {
+  const response = await fetchSessionEndpoint(`/api/session?mode=transcript&language=${language}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/sdp"
@@ -606,10 +606,29 @@ async function createTranscriptAnswer(sdp: string, language: "en" | "ja") {
 
   const answerSdp = await response.text();
   if (!response.ok) {
-    throw new Error(readApiError(answerSdp));
+    throw new Error(readApiError(answerSdp, response));
   }
 
   return answerSdp;
+}
+
+async function fetchSessionEndpoint(input: RequestInfo | URL, init: RequestInit) {
+  try {
+    return await fetch(input, {
+      ...init,
+      credentials: "include"
+    });
+  } catch (error) {
+    throw new Error(createNetworkErrorMessage(error, "session"));
+  }
+}
+
+async function fetchRealtimeEndpoint(input: RequestInfo | URL, init: RequestInit) {
+  try {
+    return await fetch(input, init);
+  } catch (error) {
+    throw new Error(createNetworkErrorMessage(error, "realtime"));
+  }
 }
 
 async function createSourceWhisperSession(resources: SessionResources) {
@@ -1996,7 +2015,14 @@ function getPrimaryTranslationLanguage(mode: AppMode) {
   return isTranslationMode(mode) ? getTargetLanguage(mode) : "en";
 }
 
-function readApiError(text: string) {
+function readApiError(text: string, response?: Response) {
+  const contentType = response?.headers.get("content-type") ?? "";
+  const looksLikeHtml = contentType.includes("text/html") || /^\s*</.test(text);
+
+  if (looksLikeHtml) {
+    return "Sign-in may have expired. Reload this page, complete Cloudflare Access login, then start again.";
+  }
+
   try {
     const data = JSON.parse(text) as { error?: string; detail?: unknown };
     const detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
@@ -2004,6 +2030,21 @@ function readApiError(text: string) {
   } catch {
     return text || "Session request failed.";
   }
+}
+
+function createNetworkErrorMessage(error: unknown, target: "session" | "realtime") {
+  const message = error instanceof Error ? error.message : "";
+  const isGenericLoadFailure = /load failed|failed to fetch|network/i.test(message);
+
+  if (target === "session") {
+    return isGenericLoadFailure
+      ? "Session load failed. If Cloudflare Access is enabled, reload this page and sign in again."
+      : `Session request failed${message ? `: ${message}` : "."}`;
+  }
+
+  return isGenericLoadFailure
+    ? "Realtime connection load failed. Check network, then try Start again."
+    : `Realtime connection failed${message ? `: ${message}` : "."}`;
 }
 
 function lineKey(itemId: string | undefined, contentIndex: number | undefined) {

@@ -1,4 +1,4 @@
-const CACHE_NAME = "whisper-live-v19";
+const CACHE_NAME = "whisper-live-v20";
 const APP_SHELL = ["/", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {
